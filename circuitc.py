@@ -527,12 +527,22 @@ def compile_netlist(c: CircuitDef) -> Netlist:
 
 
 # ---------------------------------------------------------------------------
-# Emit: netlist -> .circ XML with cell-isolated tunnel layout
+# Emit: netlist -> .circ XML
 # ---------------------------------------------------------------------------
-# Every component lives in its own cell. All its ports get a short stub wire
-# to a Tunnel *inside the cell*. Tunnels (matched by label) carry every
-# inter-component net, so no wire ever leaves a cell => wire collisions are
-# impossible by construction. Structural verification double-checks anyway.
+# Gate-level circuits use a textbook schematic layout ("routed"): input pins
+# on the left feeding horizontal signal lanes, gate columns by logic depth,
+# vertical drops tapping lanes into gate inputs, risers carrying outputs back
+# up to new lanes, output pins on the right. Wire semantics measured against
+# Logisim 4.1.0: crossings don't connect, T-junctions and ports-on-wires do —
+# so lanes/drops may cross freely and only deliberate Ts join nets.
+#
+# Switch-level circuits (FETs/tgates/pulls) keep the cell-isolated tunnel
+# layout: every component in a private cell, ports stubbed to labeled
+# Tunnels, no wire ever leaves a cell.
+#
+# Both layouts also return the intended (location, signal, role) map for
+# every component port, which structural verification checks against the
+# wire geometry actually written to the file.
 
 CELL_W, CELL_H = 220, 100
 COLS = 6
@@ -557,8 +567,18 @@ def _xml_wire(a: tuple[int, int], b: tuple[int, int]) -> str:
     return f'    <wire from="({a[0]},{a[1]})" to="({b[0]},{b[1]})"/>'
 
 
-def emit_circuit_xml(net: Netlist) -> str:
+PortMap = list[tuple[tuple[int, int], str, str]]  # (loc, signal, driver|soft-driver|sink)
+
+
+def _canon(net: Netlist, sig: str) -> str:
+    while sig in net.aliases:
+        sig = net.aliases[sig]
+    return sig
+
+
+def _layout_switch(net: Netlist) -> tuple[list[str], PortMap]:
     parts: list[str] = []
+    pmap: PortMap = []
     idx = 0
 
     def tunnel(loc: tuple[int, int], label: str, facing: str):
@@ -570,6 +590,7 @@ def emit_circuit_xml(net: Netlist) -> str:
         parts.append(_xml_comp("0", "Pin", (x, y), {
             "appearance": "classic", "label": name,
         }))
+        pmap.append(((x, y), name, "driver"))
         parts.append(_xml_wire((x, y), (x + STUB, y)))
         tunnel((x + STUB, y), name, "west")
 
@@ -577,6 +598,7 @@ def emit_circuit_xml(net: Netlist) -> str:
     for sig, val in sorted(net.const_nets.items()):
         x, y = _cell_anchor(idx); idx += 1
         parts.append(_xml_comp("0", "Constant", (x, y), {"value": f"0x{val:x}"}))
+        pmap.append(((x, y), sig, "driver"))
         parts.append(_xml_wire((x, y), (x + STUB, y)))
         tunnel((x + STUB, y), sig, "west")
 
@@ -590,8 +612,10 @@ def emit_circuit_xml(net: Netlist) -> str:
         ins, _ = gate_ports(g.kind, len(g.inputs))
         for (dx, dy), sig in zip(ins, g.inputs):
             px, py = x + dx, y + dy
+            pmap.append(((px, py), sig, "sink"))
             parts.append(_xml_wire((px - STUB, py), (px, py)))
             tunnel((px - STUB, py), sig, "east")
+        pmap.append(((x, y), g.output, "driver"))
         parts.append(_xml_wire((x, y), (x + STUB, y)))
         tunnel((x + STUB, y), g.output, "west")
 
@@ -601,6 +625,7 @@ def emit_circuit_xml(net: Netlist) -> str:
         if rail in refs:
             x, y = _cell_anchor(idx); idx += 1
             parts.append(_xml_comp("0", comp_name, (x, y), {}))
+            pmap.append(((x, y), rail, "driver"))
             parts.append(_xml_wire((x, y), (x + STUB, y)))
             tunnel((x + STUB, y), rail, "west")
 
@@ -608,6 +633,9 @@ def emit_circuit_xml(net: Netlist) -> str:
     for f in net.fets:
         x, y = _cell_anchor(idx); idx += 1
         parts.append(_xml_comp("0", "Transistor", (x, y), {"type": f.kind}))
+        pmap += [((x, y), f.drain, "soft-driver"),
+                 ((x - 40, y), f.source, "sink"),
+                 ((x - 20, y - 20), f.gate, "sink")]
         parts.append(_xml_wire((x - 40 - STUB, y), (x - 40, y)))
         tunnel((x - 40 - STUB, y), f.source, "east")
         parts.append(_xml_wire((x - 20, y - 30), (x - 20, y - 20)))
@@ -619,6 +647,10 @@ def emit_circuit_xml(net: Netlist) -> str:
     for t in net.tgates:
         x, y = _cell_anchor(idx); idx += 1
         parts.append(_xml_comp("0", "Transmission Gate", (x, y), {}))
+        pmap += [((x, y), t.drain, "soft-driver"),
+                 ((x - 40, y), t.source, "sink"),
+                 ((x - 20, y - 20), t.glow, "sink"),
+                 ((x - 20, y + 20), t.ghigh, "sink")]
         parts.append(_xml_wire((x - 40 - STUB, y), (x - 40, y)))
         tunnel((x - 40 - STUB, y), t.source, "east")
         parts.append(_xml_wire((x - 20, y - 30), (x - 20, y - 20)))
@@ -634,6 +666,7 @@ def emit_circuit_xml(net: Netlist) -> str:
         parts.append(_xml_comp("0", "Pull Resistor", (x, y), {
             "facing": "north", "pull": val,
         }))
+        pmap.append(((x, y), sig, "soft-driver"))
         parts.append(_xml_wire((x, y), (x + STUB, y)))
         tunnel((x + STUB, y), sig, "west")
 
@@ -653,9 +686,128 @@ def emit_circuit_xml(net: Netlist) -> str:
             "appearance": "classic", "facing": "west",
             "type": "output", "label": name,
         }))
+        pmap.append(((x, y), name, "sink"))
+    return parts, pmap
 
+
+def _layout_routed(net: Netlist) -> tuple[list[str], PortMap]:
+    """Textbook schematic: pins left, horizontal signal lanes on top, gate
+    columns by logic depth, vertical channel drops into gate inputs, risers
+    from gate outputs back up to fresh lanes, output pins right.
+
+    Collision safety: lanes have unique y; drops/risers have unique x within
+    their channel; gate port y values are unique within a column (80px gate
+    pitch vs <=+-20px port offsets). Everything else that touches is a
+    deliberate T-junction. Crossings don't connect (measured).
+    """
+    parts: list[str] = []
+    pmap: PortMap = []
+
+    def W(a, b):
+        if a != b:
+            parts.append(_xml_wire(a, b))
+
+    cn = lambda s: _canon(net, s)
+
+    # logic depth -> gate columns (net.gates is already topologically ordered)
+    depth = {s: 0 for s in net.inputs}
+    depth.update({s: 0 for s in net.const_nets})
+    for g in net.gates:
+        depth[g.output] = 1 + max(depth[cn(i)] for i in g.inputs)
+    n_cols = max((depth[g.output] for g in net.gates), default=0)
+    cols = [[g for g in net.gates if depth[g.output] == c] for c in range(1, n_cols + 1)]
+
+    # one horizontal lane per produced signal, in production order
+    lane_sigs = list(net.inputs) + sorted(net.const_nets) + [g.output for g in net.gates]
+    lane_y = {s: 40 + 20 * i for i, s in enumerate(lane_sigs)}
+    gate_top = 40 + 20 * len(lane_sigs) + 60
+
+    X_PIN = 60
+    lane_start: dict[str, int] = {}
+    lane_need: dict[str, int] = {}  # rightmost x the lane must reach
+
+    for s in net.inputs:
+        parts.append(_xml_comp("0", "Pin", (X_PIN, lane_y[s]), {
+            "appearance": "classic", "label": s,
+        }))
+        pmap.append(((X_PIN, lane_y[s]), s, "driver"))
+        lane_start[s] = X_PIN
+    for s, v in sorted(net.const_nets.items()):
+        parts.append(_xml_comp("0", "Constant", (X_PIN, lane_y[s]), {"value": f"0x{v:x}"}))
+        pmap.append(((X_PIN, lane_y[s]), s, "driver"))
+        lane_start[s] = X_PIN
+
+    x = X_PIN
+    for col in cols:
+        # channel: one vertical drop per signal this column consumes
+        consumed: list[str] = []
+        for g in col:
+            for i in g.inputs:
+                if cn(i) not in consumed:
+                    consumed.append(cn(i))
+        chan_x = x + 40
+        drop_x = {s: chan_x + 20 * i for i, s in enumerate(consumed)}
+        gate_in_x = chan_x + 20 * len(consumed) + 20
+
+        taps: dict[str, list[int]] = {s: [] for s in consumed}
+        anchors: list[tuple[int, int]] = []
+        col_right = gate_in_x
+        for j, g in enumerate(col):
+            ax = gate_in_x + gate_axis(g.kind)
+            ay = gate_top + 20 + 80 * j
+            attrs = {"size": "30"} if g.kind == "NOT" else {
+                "size": str(GATE_SIZE), "inputs": str(len(g.inputs)),
+            }
+            parts.append(_xml_comp("1", _CIRC_NAME[g.kind], (ax, ay), attrs))
+            ins, _ = gate_ports(g.kind, len(g.inputs))
+            for (dx, dy), sig in zip(ins, g.inputs):
+                s = cn(sig)
+                px, py = ax + dx, ay + dy  # px == gate_in_x
+                W((drop_x[s], py), (px, py))
+                taps[s].append(py)
+                pmap.append(((px, py), s, "sink"))
+            pmap.append(((ax, ay), g.output, "driver"))
+            anchors.append((ax, ay))
+            col_right = max(col_right, ax)
+        for s in consumed:  # drop: T off the lane down to the lowest tap
+            W((drop_x[s], lane_y[s]), (drop_x[s], max(taps[s])))
+            lane_need[s] = max(lane_need.get(s, 0), drop_x[s])
+        for j, g in enumerate(col):  # riser: output stub right, then up to lane
+            rx = col_right + 20 + 20 * j
+            ax, ay = anchors[j]
+            W((ax, ay), (rx, ay))
+            W((rx, lane_y[g.output]), (rx, ay))
+            lane_start[g.output] = rx
+        x = col_right + 20 + 20 * len(col)
+
+    # output pins sit directly on their signal's lane at the right edge;
+    # aliased duplicates step left, connecting port-on-wire (measured OK)
+    out_x = x + 80
+    dup: dict[str, int] = {}
+    for o in net.outputs:
+        s = cn(o)
+        px = out_x - 20 * dup.get(s, 0)
+        dup[s] = dup.get(s, 0) + 1
+        parts.append(_xml_comp("0", "Pin", (px, lane_y[s]), {
+            "appearance": "classic", "facing": "west",
+            "type": "output", "label": o,
+        }))
+        pmap.append(((px, lane_y[s]), s, "sink"))
+        lane_need[s] = max(lane_need.get(s, 0), out_x)
+
+    for s in lane_sigs:
+        if s in lane_need:
+            W((lane_start[s], lane_y[s]), (lane_need[s], lane_y[s]))
+    return parts, pmap
+
+
+def emit_circuit_xml(net: Netlist) -> tuple[str, PortMap]:
+    if net.fets or net.tgates or net.pulls:
+        parts, pmap = _layout_switch(net)
+    else:
+        parts, pmap = _layout_routed(net)
     body = "\n".join(parts)
-    return (
+    xml = (
         f'  <circuit name="{escape(net.name)}">\n'
         f'    <a name="appearance" val="logisim_evolution"/>\n'
         f'    <a name="circuit" val="{escape(net.name)}"/>\n'
@@ -664,6 +816,7 @@ def emit_circuit_xml(net: Netlist) -> str:
         f"{body}\n"
         f"  </circuit>"
     )
+    return xml, pmap
 
 
 def emit_project(nets: list[Netlist]) -> str:
@@ -679,7 +832,7 @@ def emit_project(nets: list[Netlist]) -> str:
             "#Input/Output-Extra", "#Soc",
         ])
     )
-    circuits = "\n".join(emit_circuit_xml(n) for n in nets)
+    circuits = "\n".join(emit_circuit_xml(n)[0] for n in nets)
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
         '<project source="4.1.0" version="1.0">\n'
@@ -759,15 +912,29 @@ def _wire_points(a: tuple[int, int], b: tuple[int, int]):
 
 
 def analyze_circuit_xml(celem) -> dict:
-    """Recompute the netlist Logisim will infer from raw geometry."""
+    """Recompute the netlist Logisim will infer from raw geometry.
+
+    Wire semantics (measured against Logisim 4.1.0 simulation):
+      - two wires crossing mid-to-mid do NOT connect;
+      - a wire ENDPOINT landing anywhere on another wire connects (T);
+      - a component port connects to any wire passing through its location.
+    Union-find nodes are wire ids ('w', i) and locations ('p', loc).
+    """
     uf = _UF()
-    wire_pts: set = set()
+    cover: dict = {}   # grid point -> wire ids covering it
+    wires = []
     for w in celem.findall("wire"):
         a, b = _parse_loc(w.get("from")), _parse_loc(w.get("to"))
-        pts = _wire_points(a, b)
-        for p, q in zip(pts, pts[1:]):
-            uf.union(p, q)
-        wire_pts.update(pts)
+        i = len(wires)
+        wires.append((a, b))
+        for p in _wire_points(a, b):
+            cover.setdefault(p, []).append(i)
+    for i, (a, b) in enumerate(wires):
+        for end in (a, b):
+            uf.union(("w", i), ("p", end))
+            for j in cover.get(end, ()):  # endpoint touches wire j => same net
+                uf.union(("w", i), ("w", j))
+    wire_pts = set(cover)
 
     # port lists: (comp_descr, port_role, loc)
     ports = []
@@ -811,17 +978,25 @@ def analyze_circuit_xml(celem) -> dict:
                 ports.append((f"{gid}.in{i}", "sink", (loc[0] + dx, loc[1] + dy)))
             ports.append((f"{gid}.out", "driver", (loc[0] + out[0], loc[1] + out[1])))
 
+    # ports and tunnels connect to every wire passing through their location
+    for _, _, loc in ports:
+        for j in cover.get(loc, ()):
+            uf.union(("p", loc), ("w", j))
+    for loc, _ in tunnels:
+        for j in cover.get(loc, ()):
+            uf.union(("p", loc), ("w", j))
+
     # merge same-label tunnels into one electrical net, then collect the
     # full label-set per physical net (a net may legitimately carry several
     # labels when the netlist aliases them; the caller judges that).
     label_loc: dict[str, tuple[int, int]] = {}
     for loc, label in tunnels:
         if label in label_loc:
-            uf.union(loc, label_loc[label])
+            uf.union(("p", loc), ("p", label_loc[label]))
         label_loc[label] = loc
     root_labels: dict = {}
     for loc, label in tunnels:
-        root_labels.setdefault(uf.find(loc), set()).add(label)
+        root_labels.setdefault(uf.find(("p", loc)), set()).add(label)
 
     port_labels: dict[str, set] = {}   # port descr -> labels on its net
     floating: list[str] = []
@@ -830,7 +1005,7 @@ def analyze_circuit_xml(celem) -> dict:
     for _, _, loc in ports:
         loc_count[loc] = loc_count.get(loc, 0) + 1
     for descr, role, loc in ports:
-        labels = root_labels.get(uf.find(loc), set())
+        labels = root_labels.get(uf.find(("p", loc)), set())
         port_labels[descr] = labels
         if loc not in wire_pts and loc_count[loc] < 2:
             floating.append(f"FLOATING: {descr} ({role}) touches nothing")
@@ -847,57 +1022,100 @@ def analyze_circuit_xml(celem) -> dict:
 
 
 def structural_check(circ_path: str, net: Netlist) -> dict:
+    """Verify the wires actually written to disk realize the intended netlist.
+
+    The emitter deterministically maps every component port to (location,
+    signal, role); this re-derives that map, then checks it against the
+    file's wire geometry under measured Logisim connection semantics.
+    Catches emitter/router bugs: splits, shorts, floats, driver conflicts.
+    (Port-offset-table errors are the behavioral layer's job.)
+    """
     root = ET.parse(circ_path).getroot()
     celem = next(
         (c for c in root.findall("circuit") if c.get("name") == net.name), None
     )
     if celem is None:
         return {"ok": False, "errors": [f"circuit {net.name!r} not in file"]}
-    a = analyze_circuit_xml(celem)
-    errors = list(a["floating"])
+    _, pmap = emit_circuit_xml(net)
+
+    # union-find over the file's wires (same semantics as analyze_circuit_xml)
+    uf = _UF()
+    cover: dict = {}
+    wires = []
+    for w in celem.findall("wire"):
+        a, b = _parse_loc(w.get("from")), _parse_loc(w.get("to"))
+        i = len(wires)
+        wires.append((a, b))
+        for p in _wire_points(a, b):
+            cover.setdefault(p, []).append(i)
+    for i, (a, b) in enumerate(wires):
+        for end in (a, b):
+            uf.union(("w", i), ("p", end))
+            for j in cover.get(end, ()):
+                uf.union(("w", i), ("w", j))
+
+    tunnels = []
+    for comp in celem.findall("comp"):
+        if comp.get("name") == "Tunnel":
+            loc = _parse_loc(comp.get("loc"))
+            label = next((a.get("val") for a in comp.findall("a")
+                          if a.get("name") == "label"), "")
+            tunnels.append((loc, label))
+    label_loc: dict[str, tuple[int, int]] = {}
+    for loc, label in tunnels:
+        for j in cover.get(loc, ()):
+            uf.union(("p", loc), ("w", j))
+        if label in label_loc:
+            uf.union(("p", loc), ("p", label_loc[label]))
+        label_loc[label] = loc
+    for loc, _, _ in pmap:
+        for j in cover.get(loc, ()):
+            uf.union(("p", loc), ("w", j))
 
     # alias classes: signals tied by `Y = A` style assignments are ONE net
     cls = _UF()
     for dst, src in net.aliases.items():
         cls.union(dst, src)
 
-    def same_class(labels: set) -> bool:
-        roots = {cls.find(l) for l in labels}
-        return len(roots) <= 1
+    errors: list[str] = []
+    # group intended ports (and same-named tunnels) by alias class
+    class_locs: dict[str, list] = {}
+    class_roles: dict[str, list[tuple[str, str]]] = {}
+    for loc, sig, role in pmap:
+        c = cls.find(sig)
+        class_locs.setdefault(c, []).append(loc)
+        class_roles.setdefault(c, []).append((f"{sig}@{loc}", role))
+    for loc, label in tunnels:  # tunnel labels are signal names in our files
+        class_locs.setdefault(cls.find(label), []).append(loc)
 
-    # a physical net carrying labels from different alias classes is a short
-    for group in a["label_groups"]:
-        if not same_class(set(group)):
-            errors.append(f"SHORT: unrelated nets bridged: {group}")
+    # every alias class must be exactly one electrical net
+    net_of_class: dict[str, object] = {}
+    for c, locs in sorted(class_locs.items()):
+        roots = {uf.find(("p", l)) for l in locs}
+        if len(roots) > 1:
+            errors.append(f"SPLIT: net {c!r} is {len(roots)} disconnected pieces")
+        net_of_class[c] = min(roots, key=repr)
+    # ...and no two classes may share one
+    seen: dict = {}
+    for c, r in sorted(net_of_class.items()):
+        if r in seen:
+            errors.append(f"SHORT: nets {seen[r]!r} and {c!r} are connected")
+        else:
+            seen[r] = c
 
-    for name in net.inputs + net.outputs:
-        labels = a["port_labels"].get(f"pin:{name}", set())
-        if not labels or not same_class(labels | {name}):
-            errors.append(f"pin {name} not on net {name!r} (found {sorted(labels)})")
-
-    # driver discipline per alias class:
-    #   hard drivers (pins, gate outputs, constants, Power/Ground): at most 1,
-    #   and never mixed with soft drivers (FET drains, pulls) — contention.
-    #   any number of soft drivers may share a net (that's how CMOS works;
-    #   Logisim's simulator polices dynamic contention during the vector run).
-    class_drivers: dict[str, set[tuple[str, str]]] = {}
-    for lbl, ds in a["drivers"].items():
-        class_drivers.setdefault(cls.find(lbl), set()).update(ds)
-    for root, ds in sorted(class_drivers.items()):
-        hard = sorted(d for d, k in ds if k == "hard")
-        soft = sorted(d for d, k in ds if k == "soft")
+    # driver discipline per class: at most one hard driver (pin, gate output,
+    # constant, Power/Ground), never mixed with switched drivers (FET drains,
+    # pulls). Many switched drivers may share a net — that's CMOS; Logisim's
+    # simulator polices dynamic contention during the vector run.
+    for c, roles in sorted(class_roles.items()):
+        hard = sorted(d for d, k in roles if k == "driver")
+        soft = sorted(d for d, k in roles if k == "soft-driver")
         if len(hard) > 1:
-            errors.append(f"MULTIDRIVE: net {root!r} driven by {hard}")
+            errors.append(f"MULTIDRIVE: net {c!r} driven by {hard}")
         elif hard and soft:
-            errors.append(f"CONTENTION: net {root!r} has hard driver {hard} vs switched {soft}")
-    want_driven = set(net.inputs) | {g.output for g in net.gates} | set(net.const_nets)
-    want_driven |= {f.drain for f in net.fets} | {t.drain for t in net.tgates}
-    want_driven |= {n for n, _ in net.pulls}
-    if net.fets or net.tgates or "VDD" in net.referenced():
-        want_driven |= _RESERVED & net.referenced()
-    for sig in sorted({cls.find(s) for s in want_driven}):
-        if sig not in class_drivers:
-            errors.append(f"UNDRIVEN: net {sig!r} has no driver")
+            errors.append(f"CONTENTION: net {c!r} has hard driver {hard} vs switched {soft}")
+        elif not hard and not soft:
+            errors.append(f"UNDRIVEN: net {c!r} has no driver")
     return {"ok": not errors, "errors": errors}
 
 

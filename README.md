@@ -115,10 +115,13 @@ shorts unrelated nets on any 3-input gate — its port table is off by 10px).
    (≤11 inputs; 2048 random rows above that) by evaluating the source
    expressions, then runs Logisim's `--test-vector`. Catches everything else.
 
-Layout is collision-free by construction: every component sits in a private
-220×100 cell, ports connect via ≤20px stubs to Tunnels inside the cell, and
-tunnels (matched by label, not position) carry all inter-component nets.
-No wire ever crosses a cell boundary.
+Gate-level circuits get a **textbook schematic layout**: input pins on the
+left feeding horizontal signal lanes, gate columns by logic depth, vertical
+drops tapping lanes into gate inputs, output pins on the right — real routed
+wires, no tunnels. Wire-connection semantics (crossings don't connect;
+T-junctions and ports-on-wires do) were measured against Logisim 4.1.0
+simulation, and the structural layer re-checks every emitted file against
+them. Switch-level circuits use a tunnel-per-net cell layout instead.
 
 ## For LLMs: recommended loop
 
@@ -139,6 +142,7 @@ python3 test_circuitc.py   # geometry, parser, roundtrip, sabotage-detection, si
 - Buses / multi-bit signals — add a width syntax + splitters when needed.
 - Sequential logic (registers, clocks, cross-coupled latches) — needs
   `--test-circuit` benches instead of vectors.
-- Pretty layout — cells are a grid; it simulates perfectly, it's not art.
+- Pretty layout for switch-level circuits — FETs still use the tunnel-cell
+  grid; gate-level circuits are drawn schematic-style.
 - Rotated/foreign transistor orientations in `check`/`describe` — the analyzer
   models the (default) east-facing layout this tool emits and refuses others.
