@@ -11,7 +11,7 @@ verification — ending with exhaustive simulation in Logisim itself.
 ## Install
 
 ```bash
-curl -O https://raw.githubusercontent.com/Celibistrial/circuitc/main/circuitc.py
+curl -O https://raw.githubusercontent.com/Celibistrial/logisim-circuit-compiler/main/circuitc.py
 ```
 
 Requirements: Python ≥ 3.10. For the simulation layers: Java ≥ 16 and the
