@@ -761,13 +761,13 @@ def _wire_points(a: tuple[int, int], b: tuple[int, int]):
 def analyze_circuit_xml(celem) -> dict:
     """Recompute the netlist Logisim will infer from raw geometry."""
     uf = _UF()
-    wires = []
+    wire_pts: set = set()
     for w in celem.findall("wire"):
         a, b = _parse_loc(w.get("from")), _parse_loc(w.get("to"))
         pts = _wire_points(a, b)
         for p, q in zip(pts, pts[1:]):
             uf.union(p, q)
-        wires.append((a, b))
+        wire_pts.update(pts)
 
     # port lists: (comp_descr, port_role, loc)
     ports = []
@@ -826,11 +826,14 @@ def analyze_circuit_xml(celem) -> dict:
     port_labels: dict[str, set] = {}   # port descr -> labels on its net
     floating: list[str] = []
     drivers: dict[str, list[tuple[str, str]]] = {}  # label -> [(descr, hard|soft)]
+    loc_count: dict = {}               # ports may also touch port-to-port
+    for _, _, loc in ports:
+        loc_count[loc] = loc_count.get(loc, 0) + 1
     for descr, role, loc in ports:
         labels = root_labels.get(uf.find(loc), set())
         port_labels[descr] = labels
-        if not labels:
-            floating.append(f"FLOATING: {descr} ({role}) touches no labeled net")
+        if loc not in wire_pts and loc_count[loc] < 2:
+            floating.append(f"FLOATING: {descr} ({role}) touches nothing")
         elif role.endswith("driver"):
             cls = "soft" if role == "soft-driver" else "hard"
             for lbl in labels:
