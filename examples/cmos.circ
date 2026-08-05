@@ -1,23 +1,57 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<project source="4.0.0" version="1.0">
+<project source="4.1.0" version="1.0">
+  This file is intended to be loaded by Logisim-evolution (https://github.com/logisim-evolution/).
+
   <lib desc="#Wiring" name="0"/>
   <lib desc="#Gates" name="1"/>
   <lib desc="#Plexers" name="2"/>
   <lib desc="#Arithmetic" name="3"/>
-  <lib desc="#Memory" name="4"/>
-  <lib desc="#I/O" name="5"/>
-  <lib desc="#Base" name="6"/>
+  <lib desc="#FPArithmetic" name="4"/>
+  <lib desc="#Memory" name="5"/>
+  <lib desc="#I/O" name="6"/>
+  <lib desc="#TTL" name="7"/>
+  <lib desc="#TCL" name="8"/>
+  <lib desc="#Base" name="9"/>
+  <lib desc="#BFH-Praktika" name="10"/>
+  <lib desc="#Input/Output-Extra" name="11"/>
+  <lib desc="#Soc" name="12"/>
   <main name="cmos_inv"/>
   <options>
     <a name="gateUndefined" val="ignore"/>
     <a name="simlimit" val="1000"/>
     <a name="simrand" val="0"/>
   </options>
-  <mappings/>
-  <toolbar/>
+  <mappings>
+    <tool lib="9" map="Button2" name="Poke Tool"/>
+    <tool lib="9" map="Button3" name="Menu Tool"/>
+    <tool lib="9" map="Ctrl Button1" name="Menu Tool"/>
+  </mappings>
+  <toolbar>
+    <tool lib="9" name="Poke Tool"/>
+    <tool lib="9" name="Edit Tool"/>
+    <tool lib="9" name="Wiring Tool"/>
+    <tool lib="9" name="Text Tool"/>
+    <sep/>
+    <tool lib="0" name="Pin"/>
+    <tool lib="0" name="Pin">
+      <a name="facing" val="west"/>
+      <a name="type" val="output"/>
+    </tool>
+    <sep/>
+    <tool lib="1" name="NOT Gate"/>
+    <tool lib="1" name="AND Gate"/>
+    <tool lib="1" name="OR Gate"/>
+    <tool lib="1" name="XOR Gate"/>
+    <tool lib="1" name="NAND Gate"/>
+    <tool lib="1" name="NOR Gate"/>
+  </toolbar>
   <circuit name="cmos_inv">
+    <a name="appearance" val="logisim_evolution"/>
     <a name="circuit" val="cmos_inv"/>
+    <a name="circuitnamedboxfixedsize" val="true"/>
+    <a name="simulationFrequency" val="1.0"/>
     <comp lib="0" loc="(340,140)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="label" val="A"/>
     </comp>
     <wire from="(340,140)" to="(360,140)"/>
@@ -81,14 +115,19 @@
     </comp>
     <wire from="(1420,140)" to="(1440,140)"/>
     <comp lib="0" loc="(1440,140)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="facing" val="west"/>
-      <a name="output" val="true"/>
+      <a name="type" val="output"/>
       <a name="label" val="Y"/>
     </comp>
   </circuit>
   <circuit name="cmos_nand">
+    <a name="appearance" val="logisim_evolution"/>
     <a name="circuit" val="cmos_nand"/>
+    <a name="circuitnamedboxfixedsize" val="true"/>
+    <a name="simulationFrequency" val="1.0"/>
     <comp lib="0" loc="(340,140)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="label" val="A"/>
     </comp>
     <wire from="(340,140)" to="(360,140)"/>
@@ -97,6 +136,7 @@
       <a name="label" val="A"/>
     </comp>
     <comp lib="0" loc="(560,140)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="label" val="B"/>
     </comp>
     <wire from="(560,140)" to="(580,140)"/>
@@ -196,14 +236,19 @@
     </comp>
     <wire from="(760,240)" to="(780,240)"/>
     <comp lib="0" loc="(780,240)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="facing" val="west"/>
-      <a name="output" val="true"/>
+      <a name="type" val="output"/>
       <a name="label" val="Y"/>
     </comp>
   </circuit>
   <circuit name="tgate_mux">
+    <a name="appearance" val="logisim_evolution"/>
     <a name="circuit" val="tgate_mux"/>
+    <a name="circuitnamedboxfixedsize" val="true"/>
+    <a name="simulationFrequency" val="1.0"/>
     <comp lib="0" loc="(340,140)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="label" val="S"/>
     </comp>
     <wire from="(340,140)" to="(360,140)"/>
@@ -212,6 +257,7 @@
       <a name="label" val="S"/>
     </comp>
     <comp lib="0" loc="(560,140)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="label" val="D0"/>
     </comp>
     <wire from="(560,140)" to="(580,140)"/>
@@ -220,6 +266,7 @@
       <a name="label" val="D0"/>
     </comp>
     <comp lib="0" loc="(780,140)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="label" val="D1"/>
     </comp>
     <wire from="(780,140)" to="(800,140)"/>
@@ -290,14 +337,19 @@
     </comp>
     <wire from="(320,240)" to="(340,240)"/>
     <comp lib="0" loc="(340,240)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="facing" val="west"/>
-      <a name="output" val="true"/>
+      <a name="type" val="output"/>
       <a name="label" val="Y"/>
     </comp>
   </circuit>
   <circuit name="pseudo_nor">
+    <a name="appearance" val="logisim_evolution"/>
     <a name="circuit" val="pseudo_nor"/>
+    <a name="circuitnamedboxfixedsize" val="true"/>
+    <a name="simulationFrequency" val="1.0"/>
     <comp lib="0" loc="(340,140)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="label" val="A"/>
     </comp>
     <wire from="(340,140)" to="(360,140)"/>
@@ -306,6 +358,7 @@
       <a name="label" val="A"/>
     </comp>
     <comp lib="0" loc="(560,140)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="label" val="B"/>
     </comp>
     <wire from="(560,140)" to="(580,140)"/>
@@ -371,8 +424,9 @@
     </comp>
     <wire from="(320,240)" to="(340,240)"/>
     <comp lib="0" loc="(340,240)" name="Pin">
+      <a name="appearance" val="classic"/>
       <a name="facing" val="west"/>
-      <a name="output" val="true"/>
+      <a name="type" val="output"/>
       <a name="label" val="Y"/>
     </comp>
   </circuit>

@@ -567,7 +567,9 @@ def emit_circuit_xml(net: Netlist) -> str:
     # input pins
     for name in net.inputs:
         x, y = _cell_anchor(idx); idx += 1
-        parts.append(_xml_comp("0", "Pin", (x, y), {"label": name}))
+        parts.append(_xml_comp("0", "Pin", (x, y), {
+            "appearance": "classic", "label": name,
+        }))
         parts.append(_xml_wire((x, y), (x + STUB, y)))
         tunnel((x + STUB, y), name, "west")
 
@@ -648,30 +650,41 @@ def emit_circuit_xml(net: Netlist) -> str:
         tunnel((x - STUB, y), name, "east")
         parts.append(_xml_wire((x - STUB, y), (x, y)))
         parts.append(_xml_comp("0", "Pin", (x, y), {
-            "facing": "west", "output": "true", "label": name,
+            "appearance": "classic", "facing": "west",
+            "type": "output", "label": name,
         }))
 
     body = "\n".join(parts)
     return (
         f'  <circuit name="{escape(net.name)}">\n'
+        f'    <a name="appearance" val="logisim_evolution"/>\n'
         f'    <a name="circuit" val="{escape(net.name)}"/>\n'
+        f'    <a name="circuitnamedboxfixedsize" val="true"/>\n'
+        f'    <a name="simulationFrequency" val="1.0"/>\n'
         f"{body}\n"
         f"  </circuit>"
     )
 
 
 def emit_project(nets: list[Netlist]) -> str:
+    # Skeleton mirrors what Logisim Evolution 4.1.0 itself saves: the full
+    # standard-library list, mouse mappings, and a populated toolbar. An empty
+    # <toolbar/>/<mappings/> loads and simulates fine but opens a GUI with no
+    # tools and dead right-click — looks completely broken to a user.
     libs = "\n".join(
-        f'  <lib desc="{d}" name="{n}"/>'
-        for n, d in [
-            ("0", "#Wiring"), ("1", "#Gates"), ("2", "#Plexers"),
-            ("3", "#Arithmetic"), ("4", "#Memory"), ("5", "#I/O"), ("6", "#Base"),
-        ]
+        f'  <lib desc="{d}" name="{i}"/>'
+        for i, d in enumerate([
+            "#Wiring", "#Gates", "#Plexers", "#Arithmetic", "#FPArithmetic",
+            "#Memory", "#I/O", "#TTL", "#TCL", "#Base", "#BFH-Praktika",
+            "#Input/Output-Extra", "#Soc",
+        ])
     )
     circuits = "\n".join(emit_circuit_xml(n) for n in nets)
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
-        '<project source="4.0.0" version="1.0">\n'
+        '<project source="4.1.0" version="1.0">\n'
+        "  This file is intended to be loaded by Logisim-evolution "
+        "(https://github.com/logisim-evolution/).\n\n"
         f"{libs}\n"
         f'  <main name="{escape(nets[0].name)}"/>\n'
         "  <options>\n"
@@ -679,8 +692,30 @@ def emit_project(nets: list[Netlist]) -> str:
         '    <a name="simlimit" val="1000"/>\n'
         '    <a name="simrand" val="0"/>\n'
         "  </options>\n"
-        "  <mappings/>\n"
-        "  <toolbar/>\n"
+        "  <mappings>\n"
+        '    <tool lib="9" map="Button2" name="Poke Tool"/>\n'
+        '    <tool lib="9" map="Button3" name="Menu Tool"/>\n'
+        '    <tool lib="9" map="Ctrl Button1" name="Menu Tool"/>\n'
+        "  </mappings>\n"
+        "  <toolbar>\n"
+        '    <tool lib="9" name="Poke Tool"/>\n'
+        '    <tool lib="9" name="Edit Tool"/>\n'
+        '    <tool lib="9" name="Wiring Tool"/>\n'
+        '    <tool lib="9" name="Text Tool"/>\n'
+        "    <sep/>\n"
+        '    <tool lib="0" name="Pin"/>\n'
+        '    <tool lib="0" name="Pin">\n'
+        '      <a name="facing" val="west"/>\n'
+        '      <a name="type" val="output"/>\n'
+        "    </tool>\n"
+        "    <sep/>\n"
+        '    <tool lib="1" name="NOT Gate"/>\n'
+        '    <tool lib="1" name="AND Gate"/>\n'
+        '    <tool lib="1" name="OR Gate"/>\n'
+        '    <tool lib="1" name="XOR Gate"/>\n'
+        '    <tool lib="1" name="NAND Gate"/>\n'
+        '    <tool lib="1" name="NOR Gate"/>\n'
+        "  </toolbar>\n"
         f"{circuits}\n"
         "</project>\n"
     )
@@ -744,8 +779,8 @@ def analyze_circuit_xml(celem) -> dict:
         if name == "Tunnel":
             tunnels.append((loc, attrs.get("label", "")))
         elif name == "Pin":
-            role = "driver" if attrs.get("output") != "true" else "sink"
-            ports.append((f'pin:{attrs.get("label", "?")}', role, loc))
+            is_out = attrs.get("type") == "output" or attrs.get("output") == "true"
+            ports.append((f'pin:{attrs.get("label", "?")}', "sink" if is_out else "driver", loc))
         elif name == "Constant":
             ports.append((f"const@{loc}", "driver", loc))
         elif name in ("Power", "Ground"):
@@ -753,15 +788,20 @@ def analyze_circuit_xml(celem) -> dict:
         elif name == "Pull Resistor":
             ports.append((f"pull@{loc}", "soft-driver", loc))
         elif name in ("Transistor", "Transmission Gate"):
-            # analysis only models the orientation we emit
-            if attrs.get("facing", "east") != "east" or attrs.get("selloc", "tr") != "tr":
-                raise ValueError(f"{name}@{loc}: only east-facing/selloc=tr supported")
+            # Transistor.updatePorts / TransmissionGate.updatePorts, all
+            # orientations (validated against GUI-drawn wires in real files)
+            facing = attrs.get("facing", "east")
+            dx, dy = {"north": (0, 1), "east": (-1, 0),
+                      "south": (0, -1), "west": (1, 0)}[facing]
+            flip = (facing in ("north", "west")) == (attrs.get("selloc", "tr") == "tr")
+            g_a = (loc[0] + 20 * (dx + dy), loc[1] + 20 * (-dx + dy))
+            g_b = (loc[0] + 20 * (dx - dy), loc[1] + 20 * (dx + dy))
             gid = f"{'fet' if name == 'Transistor' else 'tgate'}@{loc}"
             ports.append((f"{gid}.drain", "soft-driver", loc))
-            ports.append((f"{gid}.source", "sink", (loc[0] - 40, loc[1])))
-            ports.append((f"{gid}.gate0", "sink", (loc[0] - 20, loc[1] - 20)))
+            ports.append((f"{gid}.source", "sink", (loc[0] + 40 * dx, loc[1] + 40 * dy)))
+            ports.append((f"{gid}.gate0", "sink", g_a if flip else g_b))
             if name == "Transmission Gate":
-                ports.append((f"{gid}.gate1", "sink", (loc[0] - 20, loc[1] + 20)))
+                ports.append((f"{gid}.gate1", "sink", g_b if flip else g_a))
         elif name in _GATE_KINDS:
             kind = _GATE_KINDS[name]
             n = 1 if kind == "NOT" else int(attrs.get("inputs", "5"))
@@ -981,8 +1021,8 @@ def describe(circ_path: str) -> dict:
             comps[name] = comps.get(name, 0) + 1
             if name == "Pin":
                 attrs = {x.get("name"): x.get("val") for x in comp.findall("a")}
-                (pins_out if attrs.get("output") == "true" else pins_in).append(
-                    attrs.get("label", "?"))
+                is_out = attrs.get("type") == "output" or attrs.get("output") == "true"
+                (pins_out if is_out else pins_in).append(attrs.get("label", "?"))
         out["circuits"].append({
             "name": celem.get("name"),
             "inputs": pins_in,
