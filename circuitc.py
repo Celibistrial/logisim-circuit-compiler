@@ -650,16 +650,16 @@ def compile_netlist(c: CircuitDef) -> Netlist:
 # every component port, which structural verification checks against the
 # wire geometry actually written to the file.
 
-CELL_W, CELL_H = 220, 100
-COLS = 6
+CELL_W, CELL_H = 140, 70
+COLS = 8
 ORIGIN = (200, 100)
-STUB = 20
+STUB = 10
 
 
 def _cell_anchor(index: int) -> tuple[int, int]:
     col, row = index % COLS, index // COLS
     # anchor sits right-of-center so gate bodies (extend <=90 left) stay inside
-    return (ORIGIN[0] + col * CELL_W + 140, ORIGIN[1] + row * CELL_H + 40)
+    return (ORIGIN[0] + col * CELL_W + 90, ORIGIN[1] + row * CELL_H + 40)
 
 
 def _xml_comp(lib: str | None, name: str, loc: tuple[int, int], attrs: dict[str, str]) -> str:
@@ -804,7 +804,7 @@ def _route_gates(net: Netlist, registry: dict | None = None,
         placed = []
 
         def fits(ay, span=0):
-            return all(hi < ay - 25 or lo > ay + span + 25 for lo, hi in occupied)
+            return all(hi < ay - 15 or lo > ay + span + 15 for lo, hi in occupied)
 
         cursor = 20
         for node in col:
@@ -828,7 +828,7 @@ def _route_gates(net: Netlist, registry: dict | None = None,
                 while not fits(cursor, span):
                     cursor += 10
                 ay = cursor
-                cursor += span + 80
+                cursor += span + 60
             occupied.append((ay - 25, ay + span + 25))
             placed.append((node, ay, span))
             if kind == "gate":
@@ -845,8 +845,8 @@ def _route_gates(net: Netlist, registry: dict | None = None,
     for node in net.nodes:
         produced += node_outs(node)
     lane_sigs = [s for s in produced if s in promoted]
-    lane_y = {s: 40 + 20 * i for i, s in enumerate(lane_sigs)}
-    gate_top = 40 + 20 * len(lane_sigs) + 60
+    lane_y = {s: 40 + 10 * i for i, s in enumerate(lane_sigs)}
+    gate_top = 40 + 10 * len(lane_sigs) + 60
 
     X_PIN = 60
     lane_start: dict[str, int] = {}
@@ -874,9 +874,9 @@ def _route_gates(net: Netlist, registry: dict | None = None,
             for s in node_ins(node):
                 if s in promoted and s not in consumed:
                     consumed.append(s)
-        chan_x = x + 40
-        drop_x = {s: chan_x + 20 * i for i, s in enumerate(consumed)}
-        gate_in_x = chan_x + 20 * len(consumed) + 20
+        chan_x = x + 20
+        drop_x = {s: chan_x + 10 * i for i, s in enumerate(consumed)}
+        gate_in_x = chan_x + 10 * len(consumed) + 10
 
         taps: dict[str, list[int]] = {s: [] for s in consumed}
         col_right = gate_in_x
@@ -920,25 +920,25 @@ def _route_gates(net: Netlist, registry: dict | None = None,
                     if sig in promoted and (uses.get(sig) or sig in always_lane):
                         risers.append(sig)
             col_right = max(col_right, ax)
-            max_y = max(max_y, ay + span + 40)
+            max_y = max(max_y, ay + span + 30)
         for s in consumed:
             W((drop_x[s], lane_y[s]), (drop_x[s], max(taps[s])))
             lane_need[s] = max(lane_need.get(s, 0), drop_x[s])
         for j, s in enumerate(risers):
-            rx = col_right + 20 + 20 * j
+            rx = col_right + 10 + 10 * j
             ax, ay = anchor[s]
             W((ax, ay), (rx, ay))
             W((rx, lane_y[s]), (rx, ay))
             lane_start[s] = rx
-        x = col_right + 20 + 20 * len(risers)
+        x = col_right + 10 + 10 * len(risers)
 
     # output pins sit directly on their signal's lane at the right edge;
     # aliased duplicates step left, connecting port-on-wire (measured OK)
-    out_x = x + 80
+    out_x = x + 50
     dup: dict[str, int] = {}
     for o in pin_outputs:
         s = cn(o)
-        px = out_x - 20 * dup.get(s, 0)
+        px = out_x - 10 * dup.get(s, 0)
         dup[s] = dup.get(s, 0) + 1
         parts.append(_xml_comp("0", "Pin", (px, lane_y[s]), {
             "appearance": "classic", "facing": "west",
