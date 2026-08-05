@@ -31,8 +31,8 @@ Switch-level primitives (CMOS coursework) mix freely with expressions:
       spec Y = ~(A & B)     # golden model; drives test-vector generation
       pmos A: VDD -> Y      # gate: source -> drain (Logisim FETs pass one way)
       pmos B: VDD -> Y
-      nmos B: Y -> n1       # series stack through internal net n1
-      nmos A: n1 -> GND
+      nmos A: GND -> n1     # series stack through internal net n1
+      nmos B: n1 -> Y
 
     tgate C, Cn: X -> Y     # transmission gate: active-high, active-low ctrl
     pullup  Y               # pull resistor to 1
@@ -576,130 +576,32 @@ def _canon(net: Netlist, sig: str) -> str:
     return sig
 
 
-def _layout_switch(net: Netlist) -> tuple[list[str], PortMap]:
-    parts: list[str] = []
-    pmap: PortMap = []
-    idx = 0
+def _route_gates(net: Netlist, pin_outputs: list[str] | None = None,
+                 descend: list[str] | None = None) -> dict:
+    """Core schematic router for the gate-level part of a circuit.
 
-    def tunnel(loc: tuple[int, int], label: str, facing: str):
-        parts.append(_xml_comp("0", "Tunnel", loc, {"facing": facing, "label": label}))
-
-    # input pins
-    for name in net.inputs:
-        x, y = _cell_anchor(idx); idx += 1
-        parts.append(_xml_comp("0", "Pin", (x, y), {
-            "appearance": "classic", "label": name,
-        }))
-        pmap.append(((x, y), name, "driver"))
-        parts.append(_xml_wire((x, y), (x + STUB, y)))
-        tunnel((x + STUB, y), name, "west")
-
-    # constants
-    for sig, val in sorted(net.const_nets.items()):
-        x, y = _cell_anchor(idx); idx += 1
-        parts.append(_xml_comp("0", "Constant", (x, y), {"value": f"0x{val:x}"}))
-        pmap.append(((x, y), sig, "driver"))
-        parts.append(_xml_wire((x, y), (x + STUB, y)))
-        tunnel((x + STUB, y), sig, "west")
-
-    # gates
-    for g in net.gates:
-        x, y = _cell_anchor(idx); idx += 1
-        attrs = {"size": "30"} if g.kind == "NOT" else {
-            "size": str(GATE_SIZE), "inputs": str(len(g.inputs)),
-        }
-        parts.append(_xml_comp("1", _CIRC_NAME[g.kind], (x, y), attrs))
-        ins, _ = gate_ports(g.kind, len(g.inputs))
-        for (dx, dy), sig in zip(ins, g.inputs):
-            px, py = x + dx, y + dy
-            pmap.append(((px, py), sig, "sink"))
-            parts.append(_xml_wire((px - STUB, py), (px, py)))
-            tunnel((px - STUB, py), sig, "east")
-        pmap.append(((x, y), g.output, "driver"))
-        parts.append(_xml_wire((x, y), (x + STUB, y)))
-        tunnel((x + STUB, y), g.output, "west")
-
-    # power / ground rails (only if referenced)
-    refs = net.referenced()
-    for rail, comp_name in (("VDD", "Power"), ("GND", "Ground")):
-        if rail in refs:
-            x, y = _cell_anchor(idx); idx += 1
-            parts.append(_xml_comp("0", comp_name, (x, y), {}))
-            pmap.append(((x, y), rail, "driver"))
-            parts.append(_xml_wire((x, y), (x + STUB, y)))
-            tunnel((x + STUB, y), rail, "west")
-
-    # transistors: drain (0,0), source (-40,0), gate (-20,-20)  [east, selloc=tr]
-    for f in net.fets:
-        x, y = _cell_anchor(idx); idx += 1
-        parts.append(_xml_comp("0", "Transistor", (x, y), {"type": f.kind}))
-        pmap += [((x, y), f.drain, "soft-driver"),
-                 ((x - 40, y), f.source, "sink"),
-                 ((x - 20, y - 20), f.gate, "sink")]
-        parts.append(_xml_wire((x - 40 - STUB, y), (x - 40, y)))
-        tunnel((x - 40 - STUB, y), f.source, "east")
-        parts.append(_xml_wire((x - 20, y - 30), (x - 20, y - 20)))
-        tunnel((x - 20, y - 30), f.gate, "north")
-        parts.append(_xml_wire((x, y), (x + STUB, y)))
-        tunnel((x + STUB, y), f.drain, "west")
-
-    # transmission gates: + gate0 (active-low) top, gate1 (active-high) bottom
-    for t in net.tgates:
-        x, y = _cell_anchor(idx); idx += 1
-        parts.append(_xml_comp("0", "Transmission Gate", (x, y), {}))
-        pmap += [((x, y), t.drain, "soft-driver"),
-                 ((x - 40, y), t.source, "sink"),
-                 ((x - 20, y - 20), t.glow, "sink"),
-                 ((x - 20, y + 20), t.ghigh, "sink")]
-        parts.append(_xml_wire((x - 40 - STUB, y), (x - 40, y)))
-        tunnel((x - 40 - STUB, y), t.source, "east")
-        parts.append(_xml_wire((x - 20, y - 30), (x - 20, y - 20)))
-        tunnel((x - 20, y - 30), t.glow, "north")
-        parts.append(_xml_wire((x - 20, y + 20), (x - 20, y + 30)))
-        tunnel((x - 20, y + 30), t.ghigh, "south")
-        parts.append(_xml_wire((x, y), (x + STUB, y)))
-        tunnel((x + STUB, y), t.drain, "west")
-
-    # pull resistors (facing north => body hangs below the port, inside cell)
-    for sig, val in net.pulls:
-        x, y = _cell_anchor(idx); idx += 1
-        parts.append(_xml_comp("0", "Pull Resistor", (x, y), {
-            "facing": "north", "pull": val,
-        }))
-        pmap.append(((x, y), sig, "soft-driver"))
-        parts.append(_xml_wire((x, y), (x + STUB, y)))
-        tunnel((x + STUB, y), sig, "west")
-
-    # aliases: one cell with two tunnels bridged by a wire
-    for dst, src in sorted(net.aliases.items()):
-        x, y = _cell_anchor(idx); idx += 1
-        tunnel((x, y), src, "east")
-        parts.append(_xml_wire((x, y), (x + STUB * 2, y)))
-        tunnel((x + STUB * 2, y), dst, "west")
-
-    # output pins
-    for name in net.outputs:
-        x, y = _cell_anchor(idx); idx += 1
-        tunnel((x - STUB, y), name, "east")
-        parts.append(_xml_wire((x - STUB, y), (x, y)))
-        parts.append(_xml_comp("0", "Pin", (x, y), {
-            "appearance": "classic", "facing": "west",
-            "type": "output", "label": name,
-        }))
-        pmap.append(((x, y), name, "sink"))
-    return parts, pmap
-
-
-def _layout_routed(net: Netlist) -> tuple[list[str], PortMap]:
-    """Textbook schematic: pins left, horizontal signal lanes on top, gate
+    Textbook style: input pins left, horizontal signal lanes on top, gate
     columns by logic depth, vertical channel drops into gate inputs, risers
-    from gate outputs back up to fresh lanes, output pins right.
+    from gate outputs up to fresh lanes, output pins right.
 
-    Collision safety: lanes have unique y; drops/risers have unique x within
-    their channel; gate port y values are unique within a column (80px gate
-    pitch vs <=+-20px port offsets). Everything else that touches is a
-    deliberate T-junction. Crossings don't connect (measured).
+    Human touches: a signal with exactly one consumer in the next column is
+    routed as a single straight wire (its consumer gate is row-aligned with
+    the producer when possible) instead of going up-and-over the lane band;
+    unconsumed signals get no riser.
+
+    Collision safety: lanes have unique y; drops/risers unique x per channel;
+    gate y-intervals disjoint within a column so port ys are unique; straight
+    direct wires run at a producer-output y, which is never a drop endpoint
+    (drop endpoints are tap ys of *other* signals — one port, one signal) and
+    never a riser bottom (direct producers get no riser). Everything else
+    that touches is a deliberate T. Crossings don't connect (measured).
+
+    Returns a state dict for embedding (e.g. under a CMOS band layout):
+    parts/pmap plus lane geometry, so callers may extend lane_need before
+    finalize_lanes() is applied.
     """
+    pin_outputs = net.outputs if pin_outputs is None else pin_outputs
+    descend = descend or []
     parts: list[str] = []
     pmap: PortMap = []
 
@@ -709,7 +611,6 @@ def _layout_routed(net: Netlist) -> tuple[list[str], PortMap]:
 
     cn = lambda s: _canon(net, s)
 
-    # logic depth -> gate columns (net.gates is already topologically ordered)
     depth = {s: 0 for s in net.inputs}
     depth.update({s: 0 for s in net.const_nets})
     for g in net.gates:
@@ -717,14 +618,68 @@ def _layout_routed(net: Netlist) -> tuple[list[str], PortMap]:
     n_cols = max((depth[g.output] for g in net.gates), default=0)
     cols = [[g for g in net.gates if depth[g.output] == c] for c in range(1, n_cols + 1)]
 
-    # one horizontal lane per produced signal, in production order
-    lane_sigs = list(net.inputs) + sorted(net.const_nets) + [g.output for g in net.gates]
+    # ---- pre-pass: which signals are lane-promoted vs routed straight ----
+    uses: dict[str, int] = {}
+    span_far: dict[str, bool] = {}
+    for ci, col in enumerate(cols, start=1):
+        for g in col:
+            for i in g.inputs:
+                s = cn(i)
+                uses[s] = uses.get(s, 0) + 1
+                if ci - depth.get(s, 0) > 1:
+                    span_far[s] = True
+    always_lane = set(net.inputs) | set(net.const_nets) | {cn(o) for o in pin_outputs}
+    always_lane |= {cn(s) for s in descend}
+
+    # row planning per column: aligned rows for straight-wire candidates.
+    # rel_out_y[sig] = producer output y relative to gate_top.
+    rel_out_y = {}
+    direct: set[str] = set()  # signals drawn as one straight wire
+    col_rows: list[list[tuple]] = []  # per column: [(gate, rel_ay)]
+    for ci, col in enumerate(cols, start=1):
+        occupied: list[tuple[int, int]] = []  # (lo, hi) rel y intervals
+        placed = []
+
+        def fits(ay):
+            return all(hi < ay - 25 or lo > ay + 25 for lo, hi in occupied)
+
+        cursor = 20
+        for g in col:
+            ay = None
+            # try row-aligning with a straight-wire input (center port only)
+            ins, _ = gate_ports(g.kind, len(g.inputs))
+            for (dx, dy), sig in zip(ins, g.inputs):
+                s = cn(sig)
+                if (dy == 0 and uses.get(s) == 1 and s not in always_lane
+                        and not span_far.get(s) and s in rel_out_y
+                        and depth.get(s, 0) == ci - 1 and fits(rel_out_y[s])):
+                    ay = rel_out_y[s]
+                    direct.add(s)
+                    break
+            if ay is None:
+                while not fits(cursor):
+                    cursor += 10
+                ay = cursor
+                cursor += 80
+            occupied.append((ay - 25, ay + 25))
+            placed.append((g, ay))
+            rel_out_y[g.output] = ay
+        col_rows.append(placed)
+
+    promoted = {s for s in uses if s not in direct} | always_lane
+
+    # ---- absolute geometry ----
+    lane_sigs = [s for s in (list(net.inputs) + sorted(net.const_nets)
+                             + [g.output for g in net.gates])
+                 if s in promoted]
     lane_y = {s: 40 + 20 * i for i, s in enumerate(lane_sigs)}
     gate_top = 40 + 20 * len(lane_sigs) + 60
 
     X_PIN = 60
     lane_start: dict[str, int] = {}
-    lane_need: dict[str, int] = {}  # rightmost x the lane must reach
+    lane_need: dict[str, int] = {}
+    anchor: dict[str, tuple[int, int]] = {}  # producer output port per signal
+    max_y = gate_top
 
     for s in net.inputs:
         parts.append(_xml_comp("0", "Pin", (X_PIN, lane_y[s]), {
@@ -732,29 +687,31 @@ def _layout_routed(net: Netlist) -> tuple[list[str], PortMap]:
         }))
         pmap.append(((X_PIN, lane_y[s]), s, "driver"))
         lane_start[s] = X_PIN
+        anchor[s] = (X_PIN, lane_y[s])
     for s, v in sorted(net.const_nets.items()):
         parts.append(_xml_comp("0", "Constant", (X_PIN, lane_y[s]), {"value": f"0x{v:x}"}))
         pmap.append(((X_PIN, lane_y[s]), s, "driver"))
         lane_start[s] = X_PIN
+        anchor[s] = (X_PIN, lane_y[s])
 
     x = X_PIN
-    for col in cols:
-        # channel: one vertical drop per signal this column consumes
-        consumed: list[str] = []
-        for g in col:
+    for placed in col_rows:
+        consumed: list[str] = []   # lane-promoted signals tapped in this column
+        for g, _ in placed:
             for i in g.inputs:
-                if cn(i) not in consumed:
-                    consumed.append(cn(i))
+                s = cn(i)
+                if s in promoted and s not in consumed:
+                    consumed.append(s)
         chan_x = x + 40
         drop_x = {s: chan_x + 20 * i for i, s in enumerate(consumed)}
         gate_in_x = chan_x + 20 * len(consumed) + 20
 
         taps: dict[str, list[int]] = {s: [] for s in consumed}
-        anchors: list[tuple[int, int]] = []
         col_right = gate_in_x
-        for j, g in enumerate(col):
+        risers = []
+        for g, rel_ay in placed:
             ax = gate_in_x + gate_axis(g.kind)
-            ay = gate_top + 20 + 80 * j
+            ay = gate_top + rel_ay
             attrs = {"size": "30"} if g.kind == "NOT" else {
                 "size": str(GATE_SIZE), "inputs": str(len(g.inputs)),
             }
@@ -763,28 +720,34 @@ def _layout_routed(net: Netlist) -> tuple[list[str], PortMap]:
             for (dx, dy), sig in zip(ins, g.inputs):
                 s = cn(sig)
                 px, py = ax + dx, ay + dy  # px == gate_in_x
-                W((drop_x[s], py), (px, py))
-                taps[s].append(py)
                 pmap.append(((px, py), s, "sink"))
+                if s in direct:
+                    W(anchor[s], (px, py))  # straight wire, same y by planning
+                else:
+                    W((drop_x[s], py), (px, py))
+                    taps[s].append(py)
             pmap.append(((ax, ay), g.output, "driver"))
-            anchors.append((ax, ay))
+            anchor[g.output] = (ax, ay)
+            if g.output in promoted and (uses.get(g.output) or g.output in always_lane):
+                risers.append(g)
             col_right = max(col_right, ax)
-        for s in consumed:  # drop: T off the lane down to the lowest tap
+            max_y = max(max_y, ay + 40)
+        for s in consumed:
             W((drop_x[s], lane_y[s]), (drop_x[s], max(taps[s])))
             lane_need[s] = max(lane_need.get(s, 0), drop_x[s])
-        for j, g in enumerate(col):  # riser: output stub right, then up to lane
+        for j, g in enumerate(risers):
             rx = col_right + 20 + 20 * j
-            ax, ay = anchors[j]
+            ax, ay = anchor[g.output]
             W((ax, ay), (rx, ay))
             W((rx, lane_y[g.output]), (rx, ay))
             lane_start[g.output] = rx
-        x = col_right + 20 + 20 * len(col)
+        x = col_right + 20 + 20 * len(risers)
 
     # output pins sit directly on their signal's lane at the right edge;
     # aliased duplicates step left, connecting port-on-wire (measured OK)
     out_x = x + 80
     dup: dict[str, int] = {}
-    for o in net.outputs:
+    for o in pin_outputs:
         s = cn(o)
         px = out_x - 20 * dup.get(s, 0)
         dup[s] = dup.get(s, 0) + 1
@@ -795,9 +758,343 @@ def _layout_routed(net: Netlist) -> tuple[list[str], PortMap]:
         pmap.append(((px, lane_y[s]), s, "sink"))
         lane_need[s] = max(lane_need.get(s, 0), out_x)
 
-    for s in lane_sigs:
-        if s in lane_need:
-            W((lane_start[s], lane_y[s]), (lane_need[s], lane_y[s]))
+    return {
+        "parts": parts, "pmap": pmap, "lane_y": lane_y,
+        "lane_start": lane_start, "lane_need": lane_need,
+        "right": out_x + 40, "bottom": max_y,
+    }
+
+
+def _finalize_lanes(st: dict):
+    for s, ly in st["lane_y"].items():
+        if s in st["lane_need"] and st["lane_need"][s] > st["lane_start"][s]:
+            st["parts"].append(_xml_wire((st["lane_start"][s], ly),
+                                         (st["lane_need"][s], ly)))
+
+
+def _layout_routed(net: Netlist) -> tuple[list[str], PortMap]:
+    st = _route_gates(net)
+    _finalize_lanes(st)
+    return st["parts"], st["pmap"]
+
+
+def _layout_switch(net: Netlist) -> tuple[list[str], PortMap]:
+    """CMOS-style schematic for circuits with switch-level primitives.
+
+    Band structure (top to bottom), after the Fable-5 design review:
+      1. input pins / gate-level logic (reuses _route_gates), lanes on top
+      2. Power + horizontal VDD subrail
+      3. PMOS series stacks, facing south, drains descending toward
+      4. horizontal net rails (one unique y per net) + tgate / pass-FET rows,
+         with pull resistors and output pins sitting directly on rails
+      5. NMOS series stacks, facing north, sources down on
+      6. horizontal GND subrail + Ground
+
+    Signals produced in band 1 descend on unique-x feed wires into their
+    band-4 rail; FET gate ports are tapped from rails through per-column gap
+    slots so no horizontal ever crosses another column's gate ports.
+    All uniqueness is enforced by allocators; crossings don't connect.
+    """
+    cn = lambda s: _canon(net, s)
+    switch_driven = {cn(f.drain) for f in net.fets} | {cn(t.drain) for t in net.tgates}
+    for g in net.gates:
+        for i in g.inputs:
+            if cn(i) in switch_driven:
+                raise ValueError(
+                    f"{net.name}: gate input {i!r} is driven by a transistor; "
+                    "routing gate logic below switch nets is not supported yet — "
+                    "restructure so gates feed transistors, not the reverse"
+                )
+
+    # nets produced in band 1 and consumed by the switch region
+    descend_set: list[str] = []
+
+    def need_descend(s):
+        s = cn(s)
+        if s not in _RESERVED and s not in switch_driven and s not in descend_set:
+            descend_set.append(s)
+
+    for f in net.fets:
+        need_descend(f.gate)
+        if cn(f.source) not in switch_driven:
+            need_descend(f.source)
+    for t in net.tgates:
+        for s in (t.ghigh, t.glow):
+            need_descend(s)
+        if cn(t.source) not in switch_driven:
+            need_descend(t.source)
+    for s, _ in net.pulls:
+        if cn(s) not in switch_driven and cn(s) not in _RESERVED:
+            need_descend(s)
+
+    band1_producible = set(net.inputs) | set(net.const_nets) | {g.output for g in net.gates}
+    for s in descend_set:
+        if s not in band1_producible:
+            raise ValueError(
+                f"{net.name}: {s!r} feeds a transistor terminal but is not an "
+                "input, constant, or gate output — cannot route"
+            )
+
+    pin_outputs = [o for o in net.outputs if cn(o) not in switch_driven]
+    st = _route_gates(net, pin_outputs=pin_outputs, descend=descend_set)
+    parts, pmap = st["parts"], st["pmap"]
+
+    def W(a, b):
+        if a != b:
+            parts.append(_xml_wire(a, b))
+
+    # ---- chain extraction (series stacks) ----
+    term_uses: dict[str, list] = {}
+    for f in net.fets:
+        term_uses.setdefault(cn(f.source), []).append((f, "source"))
+        term_uses.setdefault(cn(f.drain), []).append((f, "drain"))
+    fixed = (set(net.inputs) | set(net.outputs) | _RESERVED | set(descend_set)
+             | {cn(s) for s, _ in net.pulls} | {cn(t.drain) for t in net.tgates}
+             | {cn(t.source) for t in net.tgates})
+
+    def internal(s):
+        u = term_uses.get(s, [])
+        return (s not in fixed and len(u) == 2
+                and {r for _, r in u} == {"source", "drain"})
+
+    unused = list(net.fets)
+    chains: list[list[Fet]] = []
+    for f in list(unused):
+        if f not in unused or internal(cn(f.source)):
+            continue
+        chain = [f]
+        unused.remove(f)
+        while internal(cn(chain[-1].drain)):
+            nxt = next(g for g, r in term_uses[cn(chain[-1].drain)] if r == "source")
+            chain.append(nxt)
+            unused.remove(nxt)
+        chains.append(chain)
+    chains += [[f] for f in unused]  # cycles: draw as singleton pass rows
+
+    up = [c for c in chains if cn(c[0].source) == "VDD"]
+    dn = [c for c in chains if cn(c[0].source) == "GND"]
+    pas = [c for c in chains if c not in up and c not in dn]
+
+    # ---- x layout ----
+    band1_right = st["right"]
+    feed_x = {s: band1_right + 40 + 20 * i for i, s in enumerate(descend_set)}
+    x_fet0 = band1_right + 40 + 20 * len(descend_set) + 40
+
+    # columns: pair up/down chains that drive the same net onto shared x
+    drains = []
+    for c in up + dn:
+        d = cn(c[-1].drain)
+        if d not in drains:
+            drains.append(d)
+    columns: list[tuple] = []  # (bx, up_chain|None, dn_chain|None)
+    bx = x_fet0
+    for d in drains:
+        ups = [c for c in up if cn(c[-1].drain) == d]
+        dns = [c for c in dn if cn(c[-1].drain) == d]
+        for k in range(max(len(ups), len(dns))):
+            u = ups[k] if k < len(ups) else None
+            n = dns[k] if k < len(dns) else None
+            taps = (len(u) if u else 0) + (len(n) if n else 0)
+            bx += max(80, 40 + 10 * taps + 20)
+            columns.append((bx, u, n))
+    cols_right = bx + 40
+
+    # tgate / pass rows region
+    max_row_len = max([len(c) for c in pas] + [1] if (pas or net.tgates) else [0])
+    n_src_jogs = len(pas) + 3 * len(net.tgates)  # tgate: glow + ghigh + source
+    x_tg = cols_right + 10 * n_src_jogs + 60
+    rows_right = x_tg + 60 * max(0, max_row_len - 1) + 20
+    n_dst_jogs = len(pas) + len(net.tgates) + 2 * len(net.pulls)
+    x_right = rows_right + 20 + 10 * n_dst_jogs + 20
+
+    # ---- y layout ----
+    max_up = max([len(c) for c in up], default=0)
+    max_dn = max([len(c) for c in dn], default=0)
+    y_psrc = st["bottom"] + 60
+    y_rail0 = y_psrc + (40 + 60 * (max_up - 1) + 40 if up else 20)
+
+    rail_y: dict[str, int] = {}
+    row_y: list[int] = []
+    cur = y_rail0
+    rail_nets: list[str] = []
+    for d in drains:
+        rail_nets.append(d)
+    for s in descend_set:
+        rail_nets.append(s)
+    for c in pas:  # pass terminal nets
+        for s in (cn(c[0].source), cn(c[-1].drain)):
+            if s not in rail_nets and s not in _RESERVED:
+                rail_nets.append(s)
+    for t in net.tgates:
+        for s in (cn(t.source), cn(t.drain)):
+            if s not in rail_nets and s not in _RESERVED:
+                rail_nets.append(s)
+    for s, _ in net.pulls:
+        if cn(s) not in rail_nets and cn(s) not in _RESERVED:
+            rail_nets.append(cn(s))
+    for s in rail_nets:
+        rail_y[s] = cur
+        cur += 20
+    for _ in range(len(pas) + len(net.tgates)):
+        row_y.append(cur + 30)
+        cur += 60
+    rails_end = cur
+    y_gsrc = rails_end + (40 + 60 * (max_dn - 1) + 40 if dn else 20)
+    rail_y["VDD"] = y_psrc
+    rail_y["GND"] = y_gsrc
+
+    touch: dict[str, list[int]] = {s: [] for s in rail_y}  # xs touching each rail
+
+    # ---- feeds: band-1 lanes down into band-4 rails ----
+    for s in descend_set:
+        fx = feed_x[s]
+        st["lane_need"][s] = max(st["lane_need"].get(s, 0), fx)
+        W((fx, st["lane_y"][s]), (fx, rail_y[s]))
+        touch[s].append(fx)
+
+    # ---- FET stack columns ----
+    def emit_fet(f, loc, facing):
+        if facing == "south":  # pull-up: drain at loc, source above, gate left-up
+            offs = {"source": (0, -40), "gate": (-20, -20)}
+            attrs = {"type": f.kind, "facing": "south", "selloc": "bl"}
+        elif facing == "north":  # pull-down: source below, gate left-down
+            offs = {"source": (0, 40), "gate": (-20, 20)}
+            attrs = {"type": f.kind, "facing": "north", "selloc": "bl"}
+        else:  # east (pass rows): source left, gate left-up
+            offs = {"source": (-40, 0), "gate": (-20, -20)}
+            attrs = {"type": f.kind}
+        parts.append(_xml_comp("0", "Transistor", loc, attrs))
+        pmap.append((loc, cn(f.drain), "soft-driver"))
+        pmap.append(((loc[0] + offs["source"][0], loc[1] + offs["source"][1]),
+                     cn(f.source), "sink"))
+        gp = (loc[0] + offs["gate"][0], loc[1] + offs["gate"][1])
+        pmap.append((gp, cn(f.gate), "sink"))
+        return gp
+
+    for bx_c, u_chain, n_chain in columns:
+        slot = bx_c - 30  # gap tap slots, stepping left
+        if u_chain:
+            for i, f in enumerate(u_chain):
+                dy_ = y_psrc + 40 + 60 * i
+                gp = emit_fet(f, (bx_c, dy_), "south")
+                if i + 1 < len(u_chain):
+                    W((bx_c, dy_), (bx_c, dy_ + 20))  # drain -> next source
+                s = cn(f.gate)
+                W((slot, gp[1]), (gp[0], gp[1]))
+                W((slot, gp[1]), (slot, rail_y[s]))
+                touch[s].append(slot)
+                slot -= 10
+            d = cn(u_chain[-1].drain)
+            W((bx_c, y_psrc + 40 + 60 * (len(u_chain) - 1)), (bx_c, rail_y[d]))
+            touch[d].append(bx_c)
+            touch["VDD"].append(bx_c)  # head source sits on the VDD subrail
+        if n_chain:
+            for i, f in enumerate(n_chain):
+                dy_ = y_gsrc - 40 - 60 * i
+                gp = emit_fet(f, (bx_c, dy_), "north")
+                if i + 1 < len(n_chain):
+                    W((bx_c, dy_ - 20), (bx_c, dy_))
+                s = cn(f.gate)
+                W((slot, gp[1]), (gp[0], gp[1]))
+                W((slot, rail_y[s]), (slot, gp[1]))
+                touch[s].append(slot)
+                slot -= 10
+            d = cn(n_chain[-1].drain)
+            W((bx_c, rail_y[d]), (bx_c, y_gsrc - 40 - 60 * (len(n_chain) - 1)))
+            touch[d].append(bx_c)
+            touch["GND"].append(bx_c)
+
+    # ---- pass chains and transmission gates: east-facing rows in band 4 ----
+    src_jog = cols_right + 10
+    dst_jog = rows_right + 20
+    row_i = 0
+    for c in pas:
+        ry = row_y[row_i]; row_i += 1
+        for i, f in enumerate(c):
+            fx_ = x_tg + 60 * i
+            gp = emit_fet(f, (fx_, ry), "east")
+            if i + 1 < len(c):
+                W((fx_, ry), (fx_ + 20, ry))
+            s = cn(f.gate)
+            W((gp[0], rail_y[s]), (gp[0], gp[1]))  # gate drop straight from rail
+            touch[s].append(gp[0])
+        s = cn(c[0].source)
+        W((src_jog, ry), (x_tg - 40, ry))
+        W((src_jog, rail_y[s]), (src_jog, ry))
+        touch[s].append(src_jog)
+        src_jog += 10
+        d = cn(c[-1].drain)
+        tail_x = x_tg + 60 * (len(c) - 1)
+        W((tail_x, ry), (dst_jog, ry))
+        W((dst_jog, rail_y[d]), (dst_jog, ry))
+        touch[d].append(dst_jog)
+        dst_jog += 10
+    for t in net.tgates:
+        ry = row_y[row_i]; row_i += 1
+        parts.append(_xml_comp("0", "Transmission Gate", (x_tg, ry), {}))
+        pmap += [((x_tg, ry), cn(t.drain), "soft-driver"),
+                 ((x_tg - 40, ry), cn(t.source), "sink"),
+                 ((x_tg - 20, ry - 20), cn(t.glow), "sink"),
+                 ((x_tg - 20, ry + 20), cn(t.ghigh), "sink")]
+        for s, gy in ((cn(t.glow), ry - 20), (cn(t.ghigh), ry + 20)):
+            xt = src_jog
+            src_jog += 10
+            W((xt, gy), (x_tg - 20, gy))
+            W((xt, rail_y[s]), (xt, gy))
+            touch[s].append(xt)
+        s = cn(t.source)
+        W((src_jog, ry), (x_tg - 40, ry))
+        W((src_jog, rail_y[s]), (src_jog, ry))
+        touch[s].append(src_jog)
+        src_jog += 10
+        d = cn(t.drain)
+        W((x_tg, ry), (dst_jog, ry))
+        W((dst_jog, rail_y[d]), (dst_jog, ry))
+        touch[d].append(dst_jog)
+        dst_jog += 10
+
+    # ---- pull resistors: port directly on the net's rail (unique jog slot) ----
+    for s, val in net.pulls:
+        s = cn(s)
+        parts.append(_xml_comp("0", "Pull Resistor", (dst_jog, rail_y[s]), {
+            "facing": "north", "pull": val,
+        }))
+        pmap.append(((dst_jog, rail_y[s]), s, "soft-driver"))
+        touch[s].append(dst_jog)
+        dst_jog += 20
+
+    # ---- power / ground rails ----
+    xp = x_fet0 - 20
+    if touch["VDD"]:
+        parts.append(_xml_comp("0", "Power", (xp, y_psrc), {}))
+        pmap.append(((xp, y_psrc), "VDD", "driver"))
+        W((xp, y_psrc), (max(touch["VDD"]), y_psrc))
+    if touch["GND"]:
+        parts.append(_xml_comp("0", "Ground", (xp, y_gsrc), {}))
+        pmap.append(((xp, y_gsrc), "GND", "driver"))
+        W((xp, y_gsrc), (max(touch["GND"]), y_gsrc))
+
+    # ---- net rails + output pins ----
+    for s in rail_nets:
+        xs = touch[s]
+        if not xs:
+            continue
+        left, right = min(xs), max(xs)
+        if s in {cn(o) for o in net.outputs}:
+            k = 0
+            for o in net.outputs:
+                if cn(o) == s:
+                    px = x_right + 40 - 20 * k  # duplicates step left, on-rail
+                    k += 1
+                    right = max(right, px)
+                    parts.append(_xml_comp("0", "Pin", (px, rail_y[s]), {
+                        "appearance": "classic", "facing": "west",
+                        "type": "output", "label": o,
+                    }))
+                    pmap.append(((px, rail_y[s]), s, "sink"))
+        W((left, rail_y[s]), (right, rail_y[s]))
+
+    _finalize_lanes(st)
     return parts, pmap
 
 
