@@ -60,6 +60,19 @@ circuit pseudo_nor:
   pullup Y
   nmos A: GND -> Y
   nmos B: GND -> Y
+
+circuit fa1b:
+  inputs A, B, Cin
+  outputs S, Cout
+  t = A ^ B
+  S = t ^ Cin
+  Cout = (A & B) | (Cin & t)
+
+circuit rip2:
+  inputs A1, A0, B1, B0
+  outputs S1, S0, C
+  use fa1b f0(A=A0, B=B0, Cin=0) -> (S=S0, Cout=k0)
+  use fa1b f1(A=A1, B=B1, Cin=k0) -> (S=S1, Cout=C)
 """
 
 
@@ -82,6 +95,7 @@ def main():
     assert circuitc.eval_expr(e, {"A": 0, "B": 0, "C": 1}) == 0
 
     circuits = circuitc.parse_logic(SRC)
+    defs = {c.name: c for c in circuits}
     nets = [circuitc.compile_netlist(c) for c in circuits]
     with tempfile.TemporaryDirectory() as td:
         circ = Path(td) / "t.circ"
@@ -123,7 +137,7 @@ def main():
             print("OK (structural only; no logisim jar for behavioral check)")
             return
         for c in circuits:
-            b = circuitc.behavioral_check(jar, str(circ), c)
+            b = circuitc.behavioral_check(jar, str(circ), c, defs=defs)
             assert b["ok"], f"{c.name}: {b}"
         print(f"OK — structural + behavioral ({sum(2**len(c.inputs) for c in circuits)} vectors)")
 

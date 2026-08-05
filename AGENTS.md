@@ -94,14 +94,29 @@ pulldown Y              # pull resistor to 0
   than patching the `.circ`.
 - `behavioral: {"skipped": ...}` → add the missing `spec` line it names.
 
+### Hierarchy
+
+`use CIRC label(In=sig, ...) -> (Out=sig, ...)` instantiates another circuit
+as a block. CIRC must be defined earlier in the same file, or already exist
+in the `--merge` target. Wire every input pin (constants 0/1 allowed).
+
 ## Other commands
 
 ```bash
 python3 circuitc.py describe file.circ   # JSON netlist of any .circ (pins, comps, nets)
 python3 circuitc.py check file.circ      # structural + load check of an existing .circ
+python3 circuitc.py verify file.circ --spec spec.logic   # test ANY .circ against golden models
+python3 circuitc.py build new.logic -o existing.circ --merge [--lib old.logic]
 ```
 
-Use `describe` to inspect a `.circ` you didn't build before reasoning about it.
+- `verify`: spec block names must match circuit names in the file, and pin
+  labels must match the spec's inputs/outputs. Works on hand-drawn homework
+  files — use it when asked to check a circuit you didn't build.
+- `--merge`: modifies an existing .circ in place — other circuits in the file
+  are preserved, same-named ones are replaced, and your new circuits may
+  `use` the file's existing circuits. Pass `--lib old.logic` so vectors can
+  be generated for instanced circuits defined outside your source file.
+- Use `describe` to inspect a `.circ` you didn't build before reasoning about it.
 
 ## Environment
 

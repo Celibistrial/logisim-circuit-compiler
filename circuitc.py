@@ -252,6 +252,15 @@ class TGate:
 
 
 @dataclass
+class Inst:
+    """`use CIRC label(In=sig, ...) -> (Out=sig, ...)` — a subcircuit block."""
+    circ: str
+    label: str
+    ins: list[tuple[str, str]]   # (subcircuit pin, signal or "0"/"1")
+    outs: list[tuple[str, str]]  # (subcircuit pin, signal it drives)
+
+
+@dataclass
 class CircuitDef:
     name: str
     inputs: list[str] = field(default_factory=list)
@@ -261,6 +270,8 @@ class CircuitDef:
     fets: list[Fet] = field(default_factory=list)
     tgates: list[TGate] = field(default_factory=list)
     pulls: list[tuple[str, str]] = field(default_factory=list)       # (net, "0"|"1")
+    insts: list[Inst] = field(default_factory=list)
+    stmts: list[tuple] = field(default_factory=list)  # ordered ("assign",t,ast)|("inst",Inst)
 
 
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -268,6 +279,22 @@ _RESERVED = {"VDD", "GND"}
 _FET_RE = re.compile(r"^(pmos|nmos)\s+(\w+)\s*:\s*(\w+)\s*->\s*(\w+)$")
 _TGATE_RE = re.compile(r"^tgate\s+(\w+)\s*,\s*(\w+)\s*:\s*(\w+)\s*->\s*(\w+)$")
 _PULL_RE = re.compile(r"^(pullup|pulldown)\s+(\w+)$")
+_USE_RE = re.compile(r"^use\s+(\w+)\s+(\w+)\s*\(([^)]*)\)\s*->\s*\(([^)]*)\)$")
+
+
+def _parse_pinmap(s: str, what: str) -> list[tuple[str, str]]:
+    out = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise SyntaxError(f"{what}: expected pin=signal, got {part!r}")
+        pin, sig = (x.strip() for x in part.split("=", 1))
+        if not _NAME_RE.match(pin) or not (sig in ("0", "1") or _NAME_RE.match(sig)):
+            raise SyntaxError(f"{what}: bad pin mapping {part!r}")
+        out.append((pin, sig))
+    return out
 
 
 def parse_logic(text: str) -> list[CircuitDef]:
@@ -299,6 +326,16 @@ def parse_logic(text: str) -> list[CircuitDef]:
                 cur.tgates.append(TGate(ghigh, glow, source, drain))
             elif m := _PULL_RE.match(line):
                 cur.pulls.append((m.group(2), "1" if m.group(1) == "pullup" else "0"))
+            elif m := _USE_RE.match(line):
+                circ, label, ins_s, outs_s = m.groups()
+                inst = Inst(circ, label,
+                            _parse_pinmap(ins_s, f"use {label}"),
+                            _parse_pinmap(outs_s, f"use {label}"))
+                for _, sig in inst.outs:
+                    if sig in ("0", "1"):
+                        raise SyntaxError(f"use {label}: cannot drive constant {sig}")
+                cur.insts.append(inst)
+                cur.stmts.append(("inst", inst))
             elif line.startswith("spec "):
                 target, rhs = line[len("spec "):].split("=", 1)
                 target = target.strip()
@@ -310,7 +347,9 @@ def parse_logic(text: str) -> list[CircuitDef]:
                 target = target.strip()
                 if not _NAME_RE.match(target):
                     raise SyntaxError(f"bad assignment target {target!r}")
-                cur.assigns.append((target, parse_expr(rhs)))
+                ast = parse_expr(rhs)
+                cur.assigns.append((target, ast))
+                cur.stmts.append(("assign", target, ast))
             else:
                 raise SyntaxError(f"unrecognized line: {line!r}")
         except SyntaxError as e:
@@ -353,25 +392,48 @@ def _validate(c: CircuitDef):
 
     defined = set(c.inputs) | _RESERVED | switch_driven
     assigned: set[str] = set()
-    for target, ast in c.assigns:
+
+    def check_target(target, kind):
         if target in c.inputs:
-            raise SyntaxError(f"{c.name}: cannot assign to input {target!r}")
+            raise SyntaxError(f"{c.name}: cannot {kind} input {target!r}")
         if target in _RESERVED:
-            raise SyntaxError(f"{c.name}: cannot assign to reserved net {target!r}")
+            raise SyntaxError(f"{c.name}: cannot {kind} reserved net {target!r}")
         if target in assigned:
             raise SyntaxError(f"{c.name}: {target!r} assigned twice")
         if target in switch_driven:
-            raise SyntaxError(f"{c.name}: {target!r} driven by both a gate and a transistor")
-        used: set[str] = set()
-        expr_vars(ast, used)
-        missing = used - defined
-        if missing:
-            raise SyntaxError(
-                f"{c.name}: {target!r} uses undefined signal(s) {sorted(missing)} "
-                "(assignments must come after their operands)"
-            )
-        assigned.add(target)
-        defined.add(target)
+            raise SyntaxError(f"{c.name}: {target!r} driven by both logic and a transistor")
+
+    for stmt in c.stmts:
+        if stmt[0] == "assign":
+            _, target, ast = stmt
+            check_target(target, "assign to")
+            used: set[str] = set()
+            expr_vars(ast, used)
+            missing = used - defined
+            if missing:
+                raise SyntaxError(
+                    f"{c.name}: {target!r} uses undefined signal(s) {sorted(missing)} "
+                    "(assignments must come after their operands)"
+                )
+            assigned.add(target)
+            defined.add(target)
+        else:
+            inst = stmt[1]
+            for pin, sig in inst.ins:
+                if sig not in ("0", "1") and sig not in defined:
+                    raise SyntaxError(
+                        f"{c.name}: use {inst.label}: input {pin}={sig!r} is undefined "
+                        "(instances must come after their operands)"
+                    )
+            seen_pins = set()
+            for pin, sig in inst.ins + inst.outs:
+                if pin in seen_pins:
+                    raise SyntaxError(f"{c.name}: use {inst.label}: pin {pin!r} mapped twice")
+                seen_pins.add(pin)
+            for pin, sig in inst.outs:
+                check_target(sig, f"drive (via use {inst.label})")
+                assigned.add(sig)
+                defined.add(sig)
 
     # FET terminals must reference known nets
     for f in c.fets:
@@ -396,25 +458,50 @@ def _validate(c: CircuitDef):
             )
         spec_ok.add(target)
 
-    undriven = [o for o in c.outputs if o not in assigned and o not in switch_driven]
+    spec_targets = {t for t, _ in c.specs}
+    undriven = [o for o in c.outputs
+                if o not in assigned and o not in switch_driven and o not in spec_targets]
     if undriven:
         raise SyntaxError(f"{c.name}: output(s) never driven: {undriven}")
 
 
-def eval_circuit(c: CircuitDef, input_values: dict[str, int]) -> dict[str, int]:
-    """Golden-model evaluation. Raises ValueError if an output has no
-    evaluable definition (switch-driven with no spec)."""
+def eval_circuit(c: CircuitDef, input_values: dict[str, int],
+                 defs: dict[str, "CircuitDef"] | None = None) -> dict[str, int]:
+    """Golden-model evaluation. Instances of circuits present in ``defs``
+    are evaluated recursively; anything else non-evaluable falls back to
+    `spec` lines. Raises ValueError if an output stays undefined."""
+    defs = defs or {}
     env = {"VDD": 1, "GND": 0, **input_values}
-    for target, ast in c.assigns + c.specs:
+    for stmt in c.stmts:
+        if stmt[0] == "assign":
+            _, target, ast = stmt
+            try:
+                env[target] = eval_expr(ast, env)
+            except KeyError:
+                pass  # depends on a non-evaluable net; fatal only if an output needs it
+        else:
+            inst = stmt[1]
+            sub = defs.get(inst.circ)
+            if sub is None:
+                continue
+            try:
+                sub_in = {pin: (int(sig) if sig in ("0", "1") else env[sig])
+                          for pin, sig in inst.ins}
+            except KeyError:
+                continue
+            outs = eval_circuit(sub, sub_in, defs)
+            for pin, sig in inst.outs:
+                env[sig] = outs[pin]
+    for target, ast in c.specs:
         try:
             env[target] = eval_expr(ast, env)
         except KeyError:
-            pass  # depends on a switch-driven net; only fatal if an output needs it
+            pass
     missing = [o for o in c.outputs if o not in env]
     if missing:
         raise ValueError(
-            f"{c.name}: cannot generate vectors — output(s) {missing} are "
-            "switch-driven with no `spec` line"
+            f"{c.name}: cannot generate vectors — output(s) {missing} depend on "
+            "a transistor net or unknown subcircuit with no `spec` line"
         )
     return {o: env[o] for o in c.outputs}
 
@@ -435,6 +522,7 @@ class Netlist:
     name: str
     inputs: list[str]
     outputs: list[str]
+    insts: list[Inst] = field(default_factory=list)
     gates: list[Gate] = field(default_factory=list)
     # output/intermediate name -> source signal it aliases (for `Y = A` style)
     aliases: dict[str, str] = field(default_factory=dict)
@@ -442,6 +530,7 @@ class Netlist:
     fets: list[Fet] = field(default_factory=list)
     tgates: list[TGate] = field(default_factory=list)
     pulls: list[tuple[str, str]] = field(default_factory=list)
+    nodes: list[tuple] = field(default_factory=list)  # ordered ("gate",Gate)|("inst",Inst)
 
     def referenced(self) -> set[str]:
         s = set(self.inputs) | set(self.outputs) | set(self.const_nets)
@@ -518,8 +607,25 @@ def compile_netlist(c: CircuitDef) -> Netlist:
         memo.setdefault(key, sig)
         return sig
 
-    for target, ast in c.assigns:
-        emit(ast, want=target)
+    for stmt in c.stmts:
+        if stmt[0] == "assign":
+            _, target, ast = stmt
+            n_before = len(net.gates)
+            emit(ast, want=target)
+            for g in net.gates[n_before:]:
+                net.nodes.append(("gate", g))
+        else:
+            inst = stmt[1]
+            ins = []
+            for pin, sig in inst.ins:
+                if sig in ("0", "1"):  # constant literal -> shared const net
+                    cs = f"_const{sig}"
+                    net.const_nets[cs] = int(sig)
+                    sig = cs
+                ins.append((pin, sig))
+            ni = Inst(inst.circ, inst.label, ins, list(inst.outs))
+            net.insts.append(ni)
+            net.nodes.append(("inst", ni))
     net.fets = list(c.fets)
     net.tgates = list(c.tgates)
     net.pulls = list(c.pulls)
@@ -556,11 +662,12 @@ def _cell_anchor(index: int) -> tuple[int, int]:
     return (ORIGIN[0] + col * CELL_W + 140, ORIGIN[1] + row * CELL_H + 40)
 
 
-def _xml_comp(lib: str, name: str, loc: tuple[int, int], attrs: dict[str, str]) -> str:
+def _xml_comp(lib: str | None, name: str, loc: tuple[int, int], attrs: dict[str, str]) -> str:
     a = "".join(
         f'\n      <a name="{escape(k)}" val="{escape(v)}"/>' for k, v in attrs.items()
     )
-    return f'    <comp lib="{lib}" loc="({loc[0]},{loc[1]})" name="{escape(name)}">{a}\n    </comp>'
+    lib_attr = "" if lib is None else f'lib="{lib}" '  # subcircuits have no lib
+    return f'    <comp {lib_attr}loc="({loc[0]},{loc[1]})" name="{escape(name)}">{a}\n    </comp>'
 
 
 def _xml_wire(a: tuple[int, int], b: tuple[int, int]) -> str:
@@ -576,7 +683,45 @@ def _canon(net: Netlist, sig: str) -> str:
     return sig
 
 
-def _route_gates(net: Netlist, pin_outputs: list[str] | None = None,
+INST_W = 220  # DefaultEvolutionAppearance fixed-size box width (25*8 //10*10 + 20)
+
+
+def _inst_ports(inst: Inst, registry: dict) -> tuple[list, list, int]:
+    """(input ports, output ports, y-span) for a subcircuit box, relative to
+    its anchor (= topmost east-side pin). Ports are (dx, dy, signal).
+
+    Box geometry from DefaultEvolutionAppearance (fixedSize): west pins at
+    (-220, 20k), east pins at (0, 20k), each side ordered by the source
+    circuit's pin locations sorted by (y, x)."""
+    if inst.circ not in registry:
+        raise ValueError(
+            f"instance {inst.label}: circuit {inst.circ!r} is not defined yet — "
+            "define it earlier in the file (or in the merge target)"
+        )
+    in_order, out_order = registry[inst.circ]
+    ins, outs = [], []
+    for pin, sig in inst.ins:
+        if pin not in in_order:
+            raise ValueError(
+                f"instance {inst.label}: {inst.circ} has no input pin {pin!r} "
+                f"(has {in_order})")
+        ins.append((-INST_W, 20 * in_order.index(pin), sig))
+    for pin, sig in inst.outs:
+        if pin not in out_order:
+            raise ValueError(
+                f"instance {inst.label}: {inst.circ} has no output pin {pin!r} "
+                f"(has {out_order})")
+        outs.append((0, 20 * out_order.index(pin), sig))
+    unmapped = [p for p in in_order if p not in {pin for pin, _ in inst.ins}]
+    if unmapped:
+        raise ValueError(
+            f"instance {inst.label}: input pin(s) {unmapped} left unconnected")
+    span = 20 * (max(len(in_order), len(out_order)) - 1)
+    return ins, outs, span
+
+
+def _route_gates(net: Netlist, registry: dict | None = None,
+                 pin_outputs: list[str] | None = None,
                  descend: list[str] | None = None) -> dict:
     """Core schematic router for the gate-level part of a circuit.
 
@@ -602,6 +747,7 @@ def _route_gates(net: Netlist, pin_outputs: list[str] | None = None,
     """
     pin_outputs = net.outputs if pin_outputs is None else pin_outputs
     descend = descend or []
+    registry = registry or {}
     parts: list[str] = []
     pmap: PortMap = []
 
@@ -611,67 +757,94 @@ def _route_gates(net: Netlist, pin_outputs: list[str] | None = None,
 
     cn = lambda s: _canon(net, s)
 
+    def node_ins(node):
+        kind, obj = node
+        if kind == "gate":
+            return [cn(i) for i in obj.inputs]
+        return [cn(sig) for _, sig in obj.ins]
+
+    def node_outs(node):
+        kind, obj = node
+        if kind == "gate":
+            return [obj.output]
+        return [sig for _, sig in obj.outs]
+
     depth = {s: 0 for s in net.inputs}
     depth.update({s: 0 for s in net.const_nets})
-    for g in net.gates:
-        depth[g.output] = 1 + max(depth[cn(i)] for i in g.inputs)
-    n_cols = max((depth[g.output] for g in net.gates), default=0)
-    cols = [[g for g in net.gates if depth[g.output] == c] for c in range(1, n_cols + 1)]
+    for node in net.nodes:
+        d = 1 + max([depth[s] for s in node_ins(node)], default=0)
+        for s in node_outs(node):
+            depth[s] = d
+    n_cols = max([depth[s] for n in net.nodes for s in node_outs(n)], default=0)
+    cols = [[n for n in net.nodes if depth[node_outs(n)[0]] == c]
+            for c in range(1, n_cols + 1)]
 
     # ---- pre-pass: which signals are lane-promoted vs routed straight ----
     uses: dict[str, int] = {}
     span_far: dict[str, bool] = {}
+    inst_fed: set[str] = set()
     for ci, col in enumerate(cols, start=1):
-        for g in col:
-            for i in g.inputs:
-                s = cn(i)
+        for node in col:
+            for s in node_ins(node):
                 uses[s] = uses.get(s, 0) + 1
                 if ci - depth.get(s, 0) > 1:
                     span_far[s] = True
+                if node[0] == "inst":
+                    inst_fed.add(s)
     always_lane = set(net.inputs) | set(net.const_nets) | {cn(o) for o in pin_outputs}
-    always_lane |= {cn(s) for s in descend}
+    always_lane |= {cn(s) for s in descend} | inst_fed
 
     # row planning per column: aligned rows for straight-wire candidates.
     # rel_out_y[sig] = producer output y relative to gate_top.
     rel_out_y = {}
     direct: set[str] = set()  # signals drawn as one straight wire
-    col_rows: list[list[tuple]] = []  # per column: [(gate, rel_ay)]
+    col_rows: list[list[tuple]] = []  # per column: [(node, rel_ay, span)]
     for ci, col in enumerate(cols, start=1):
         occupied: list[tuple[int, int]] = []  # (lo, hi) rel y intervals
         placed = []
 
-        def fits(ay):
-            return all(hi < ay - 25 or lo > ay + 25 for lo, hi in occupied)
+        def fits(ay, span=0):
+            return all(hi < ay - 25 or lo > ay + span + 25 for lo, hi in occupied)
 
         cursor = 20
-        for g in col:
+        for node in col:
+            kind, obj = node
+            span = 0
             ay = None
-            # try row-aligning with a straight-wire input (center port only)
-            ins, _ = gate_ports(g.kind, len(g.inputs))
-            for (dx, dy), sig in zip(ins, g.inputs):
-                s = cn(sig)
-                if (dy == 0 and uses.get(s) == 1 and s not in always_lane
-                        and not span_far.get(s) and s in rel_out_y
-                        and depth.get(s, 0) == ci - 1 and fits(rel_out_y[s])):
-                    ay = rel_out_y[s]
-                    direct.add(s)
-                    break
+            if kind == "inst":
+                _, _, span = _inst_ports(obj, registry)
+            else:
+                # try row-aligning with a straight-wire input (center port only)
+                ins, _ = gate_ports(obj.kind, len(obj.inputs))
+                for (dx, dy), sig in zip(ins, obj.inputs):
+                    s = cn(sig)
+                    if (dy == 0 and uses.get(s) == 1 and s not in always_lane
+                            and not span_far.get(s) and s in rel_out_y
+                            and depth.get(s, 0) == ci - 1 and fits(rel_out_y[s])):
+                        ay = rel_out_y[s]
+                        direct.add(s)
+                        break
             if ay is None:
-                while not fits(cursor):
+                while not fits(cursor, span):
                     cursor += 10
                 ay = cursor
-                cursor += 80
-            occupied.append((ay - 25, ay + 25))
-            placed.append((g, ay))
-            rel_out_y[g.output] = ay
+                cursor += span + 80
+            occupied.append((ay - 25, ay + span + 25))
+            placed.append((node, ay, span))
+            if kind == "gate":
+                rel_out_y[obj.output] = ay
+            else:
+                for _, dy, sig in _inst_ports(obj, registry)[1]:
+                    rel_out_y[sig] = ay + dy
         col_rows.append(placed)
 
     promoted = {s for s in uses if s not in direct} | always_lane
 
     # ---- absolute geometry ----
-    lane_sigs = [s for s in (list(net.inputs) + sorted(net.const_nets)
-                             + [g.output for g in net.gates])
-                 if s in promoted]
+    produced = list(net.inputs) + sorted(net.const_nets)
+    for node in net.nodes:
+        produced += node_outs(node)
+    lane_sigs = [s for s in produced if s in promoted]
     lane_y = {s: 40 + 20 * i for i, s in enumerate(lane_sigs)}
     gate_top = 40 + 20 * len(lane_sigs) + 60
 
@@ -697,9 +870,8 @@ def _route_gates(net: Netlist, pin_outputs: list[str] | None = None,
     x = X_PIN
     for placed in col_rows:
         consumed: list[str] = []   # lane-promoted signals tapped in this column
-        for g, _ in placed:
-            for i in g.inputs:
-                s = cn(i)
+        for node, _, _ in placed:
+            for s in node_ins(node):
                 if s in promoted and s not in consumed:
                     consumed.append(s)
         chan_x = x + 40
@@ -708,39 +880,56 @@ def _route_gates(net: Netlist, pin_outputs: list[str] | None = None,
 
         taps: dict[str, list[int]] = {s: [] for s in consumed}
         col_right = gate_in_x
-        risers = []
-        for g, rel_ay in placed:
-            ax = gate_in_x + gate_axis(g.kind)
+        risers: list[str] = []  # signals needing a riser to their lane
+
+        def sink_port(s, px, py):
+            pmap.append(((px, py), s, "sink"))
+            if s in direct:
+                W(anchor[s], (px, py))  # straight wire, same y by planning
+            else:
+                W((drop_x[s], py), (px, py))
+                taps[s].append(py)
+
+        for node, rel_ay, span in placed:
+            kind, obj = node
             ay = gate_top + rel_ay
-            attrs = {"size": "30"} if g.kind == "NOT" else {
-                "size": str(GATE_SIZE), "inputs": str(len(g.inputs)),
-            }
-            parts.append(_xml_comp("1", _CIRC_NAME[g.kind], (ax, ay), attrs))
-            ins, _ = gate_ports(g.kind, len(g.inputs))
-            for (dx, dy), sig in zip(ins, g.inputs):
-                s = cn(sig)
-                px, py = ax + dx, ay + dy  # px == gate_in_x
-                pmap.append(((px, py), s, "sink"))
-                if s in direct:
-                    W(anchor[s], (px, py))  # straight wire, same y by planning
-                else:
-                    W((drop_x[s], py), (px, py))
-                    taps[s].append(py)
-            pmap.append(((ax, ay), g.output, "driver"))
-            anchor[g.output] = (ax, ay)
-            if g.output in promoted and (uses.get(g.output) or g.output in always_lane):
-                risers.append(g)
+            if kind == "gate":
+                ax = gate_in_x + gate_axis(obj.kind)
+                attrs = {"size": "30"} if obj.kind == "NOT" else {
+                    "size": str(GATE_SIZE), "inputs": str(len(obj.inputs)),
+                }
+                parts.append(_xml_comp("1", _CIRC_NAME[obj.kind], (ax, ay), attrs))
+                ins, _ = gate_ports(obj.kind, len(obj.inputs))
+                for (dx, dy), sig in zip(ins, obj.inputs):
+                    sink_port(cn(sig), ax + dx, ay + dy)  # ax+dx == gate_in_x
+                pmap.append(((ax, ay), obj.output, "driver"))
+                anchor[obj.output] = (ax, ay)
+                if obj.output in promoted and (uses.get(obj.output)
+                                               or obj.output in always_lane):
+                    risers.append(obj.output)
+            else:
+                ax = gate_in_x + INST_W
+                iports_in, iports_out, _ = _inst_ports(obj, registry)
+                parts.append(_xml_comp(None, obj.circ, (ax, ay),
+                                       {"label": obj.label}))
+                for dx, dy, sig in iports_in:
+                    sink_port(cn(sig), ax + dx, ay + dy)
+                for dx, dy, sig in iports_out:
+                    pmap.append(((ax, ay + dy), sig, "driver"))
+                    anchor[sig] = (ax, ay + dy)
+                    if sig in promoted and (uses.get(sig) or sig in always_lane):
+                        risers.append(sig)
             col_right = max(col_right, ax)
-            max_y = max(max_y, ay + 40)
+            max_y = max(max_y, ay + span + 40)
         for s in consumed:
             W((drop_x[s], lane_y[s]), (drop_x[s], max(taps[s])))
             lane_need[s] = max(lane_need.get(s, 0), drop_x[s])
-        for j, g in enumerate(risers):
+        for j, s in enumerate(risers):
             rx = col_right + 20 + 20 * j
-            ax, ay = anchor[g.output]
+            ax, ay = anchor[s]
             W((ax, ay), (rx, ay))
-            W((rx, lane_y[g.output]), (rx, ay))
-            lane_start[g.output] = rx
+            W((rx, lane_y[s]), (rx, ay))
+            lane_start[s] = rx
         x = col_right + 20 + 20 * len(risers)
 
     # output pins sit directly on their signal's lane at the right edge;
@@ -772,13 +961,13 @@ def _finalize_lanes(st: dict):
                                          (st["lane_need"][s], ly)))
 
 
-def _layout_routed(net: Netlist) -> tuple[list[str], PortMap]:
-    st = _route_gates(net)
+def _layout_routed(net: Netlist, registry: dict | None = None) -> tuple[list[str], PortMap]:
+    st = _route_gates(net, registry)
     _finalize_lanes(st)
     return st["parts"], st["pmap"]
 
 
-def _layout_switch(net: Netlist) -> tuple[list[str], PortMap]:
+def _layout_switch(net: Netlist, registry: dict | None = None) -> tuple[list[str], PortMap]:
     """CMOS-style schematic for circuits with switch-level primitives.
 
     Band structure (top to bottom), after the Fable-5 design review:
@@ -836,7 +1025,12 @@ def _layout_switch(net: Netlist) -> tuple[list[str], PortMap]:
             )
 
     pin_outputs = [o for o in net.outputs if cn(o) not in switch_driven]
-    st = _route_gates(net, pin_outputs=pin_outputs, descend=descend_set)
+    if net.insts:
+        raise ValueError(
+            f"{net.name}: subcircuit instances are not supported in "
+            "switch-level circuits yet — keep FETs and `use` in separate circuits"
+        )
+    st = _route_gates(net, registry, pin_outputs=pin_outputs, descend=descend_set)
     parts, pmap = st["parts"], st["pmap"]
 
     def W(a, b):
@@ -1098,11 +1292,27 @@ def _layout_switch(net: Netlist) -> tuple[list[str], PortMap]:
     return parts, pmap
 
 
-def emit_circuit_xml(net: Netlist) -> tuple[str, PortMap]:
+def _pin_orders(celem) -> tuple[list[str], list[str]]:
+    """(input pin names, output pin names), each sorted by (y, x) — the order
+    DefaultEvolutionAppearance places them on a subcircuit box. Accepts an
+    ElementTree <circuit> element or its XML string."""
+    if isinstance(celem, str):
+        celem = ET.fromstring(celem)
+    ins, outs = [], []
+    for comp in celem.findall("comp"):
+        if comp.get("name") == "Pin":
+            x, y = _parse_loc(comp.get("loc"))
+            attrs = {a.get("name"): a.get("val") for a in comp.findall("a")}
+            is_out = attrs.get("type") == "output" or attrs.get("output") == "true"
+            (outs if is_out else ins).append((y, x, attrs.get("label", "?")))
+    return [l for _, _, l in sorted(ins)], [l for _, _, l in sorted(outs)]
+
+
+def emit_circuit_xml(net: Netlist, registry: dict | None = None) -> tuple[str, PortMap]:
     if net.fets or net.tgates or net.pulls:
-        parts, pmap = _layout_switch(net)
+        parts, pmap = _layout_switch(net, registry)
     else:
-        parts, pmap = _layout_routed(net)
+        parts, pmap = _layout_routed(net, registry)
     body = "\n".join(parts)
     xml = (
         f'  <circuit name="{escape(net.name)}">\n'
@@ -1116,7 +1326,7 @@ def emit_circuit_xml(net: Netlist) -> tuple[str, PortMap]:
     return xml, pmap
 
 
-def emit_project(nets: list[Netlist]) -> str:
+def emit_project(nets: list[Netlist], registry: dict | None = None) -> str:
     # Skeleton mirrors what Logisim Evolution 4.1.0 itself saves: the full
     # standard-library list, mouse mappings, and a populated toolbar. An empty
     # <toolbar/>/<mappings/> loads and simulates fine but opens a GUI with no
@@ -1129,7 +1339,13 @@ def emit_project(nets: list[Netlist]) -> str:
             "#Input/Output-Extra", "#Soc",
         ])
     )
-    circuits = "\n".join(emit_circuit_xml(n)[0] for n in nets)
+    registry = dict(registry or {})
+    circuit_xmls = []
+    for n in nets:
+        xml, _ = emit_circuit_xml(n, registry)
+        registry[n.name] = _pin_orders(xml)
+        circuit_xmls.append(xml)
+    circuits = "\n".join(circuit_xmls)
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
         '<project source="4.1.0" version="1.0">\n'
@@ -1333,7 +1549,8 @@ def structural_check(circ_path: str, net: Netlist) -> dict:
     )
     if celem is None:
         return {"ok": False, "errors": [f"circuit {net.name!r} not in file"]}
-    _, pmap = emit_circuit_xml(net)
+    registry = {c.get("name"): _pin_orders(c) for c in root.findall("circuit")}
+    _, pmap = emit_circuit_xml(net, registry)
 
     # union-find over the file's wires (same semantics as analyze_circuit_xml)
     uf = _UF()
@@ -1458,7 +1675,7 @@ def load_check(jar: str, circ_path: str) -> dict:
 _MAX_EXHAUSTIVE_INPUTS = 11  # 2^11 = 2048 vector rows
 
 
-def make_vectors(c: CircuitDef) -> tuple[str, list[dict]]:
+def make_vectors(c: CircuitDef, defs: dict | None = None) -> tuple[str, list[dict]]:
     """Returns (vec file text, per-row {inputs, expected}) for failure echo."""
     n = len(c.inputs)
     header = " ".join(c.inputs + c.outputs)
@@ -1471,7 +1688,7 @@ def make_vectors(c: CircuitDef) -> tuple[str, list[dict]]:
         combos = ([rng.randint(0, 1) for _ in range(n)] for _ in range(2048))
     for combo in combos:
         env = dict(zip(c.inputs, combo))
-        outs = eval_circuit(c, env)
+        outs = eval_circuit(c, env, defs)
         lines.append(" ".join(str(v) for v in list(combo) + [outs[o] for o in c.outputs]))
         rows.append({"inputs": env, "expected": outs})
     return header + "\n" + "\n".join(lines) + "\n", rows
@@ -1484,8 +1701,9 @@ _RE_ROW_NUM = re.compile(r"^\s*(\d+)\s*$")
 _RE_MISMATCH = re.compile(r"^\s+(?P<signal>\S+)\s*=\s*(?P<got>\S+)\s*\(expected\s+(?P<expected>\S+)\)")
 
 
-def behavioral_check(jar: str, circ_path: str, c: CircuitDef, timeout: int = 120) -> dict:
-    vec, rows = make_vectors(c)
+def behavioral_check(jar: str, circ_path: str, c: CircuitDef,
+                     timeout: int = 120, defs: dict | None = None) -> dict:
+    vec, rows = make_vectors(c, defs)
     with tempfile.NamedTemporaryFile("w", suffix=".vec", delete=False) as fh:
         fh.write(vec)
         vec_path = fh.name
@@ -1557,14 +1775,61 @@ def describe(circ_path: str) -> dict:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _merge_into(out_path: str, nets: list[Netlist]) -> None:
+    """Splice built circuits into an existing .circ, preserving everything
+    else (other circuits, custom skeleton, main). Same-named circuits are
+    replaced. Component lib ids are remapped by library desc."""
+    tree = ET.parse(out_path)
+    root = tree.getroot()
+    lib_by_desc = {l.get("desc"): l.get("name") for l in root.findall("lib")}
+    remap = {}
+    for ours, desc in (("0", "#Wiring"), ("1", "#Gates")):
+        if desc not in lib_by_desc:
+            raise ValueError(f"merge target has no {desc} library")
+        remap[ours] = lib_by_desc[desc]
+    registry = {c.get("name"): _pin_orders(c) for c in root.findall("circuit")}
+
+    names = {n.name for n in nets}
+    for celem in list(root.findall("circuit")):
+        if celem.get("name") in names:
+            root.remove(celem)
+            registry.pop(celem.get("name"), None)
+    for n in nets:
+        xml, _ = emit_circuit_xml(n, registry)
+        el = ET.fromstring(xml)
+        registry[n.name] = _pin_orders(el)
+        if remap != {"0": "0", "1": "1"}:
+            for comp in el.findall("comp"):
+                if comp.get("lib") in remap:
+                    comp.set("lib", remap[comp.get("lib")])
+        el.tail = "\n"
+        root.append(el)
+    tree.write(out_path, encoding="UTF-8", xml_declaration=True)
+
+
 def cmd_build(args) -> int:
     src = Path(args.source).read_text()
     circuits = parse_logic(src)
-    nets = [compile_netlist(c) for c in circuits]
+    defs = {c.name: c for c in circuits}
+    for lib in getattr(args, "lib", None) or []:  # golden models for `use`d circuits
+        for c in parse_logic(Path(lib).read_text()):
+            defs.setdefault(c.name, c)
     out_path = args.output or str(Path(args.source).with_suffix(".circ"))
-    Path(out_path).write_text(emit_project(nets))
+    merging = getattr(args, "merge", False) and Path(out_path).exists()
+    if merging:
+        seed = {c.get("name"): _pin_orders(c)
+                for c in ET.parse(out_path).getroot().findall("circuit")}
+    else:
+        seed = {}
+    nets = [compile_netlist(c) for c in circuits]
+    if merging:
+        _merge_into(out_path, nets)
+    else:
+        Path(out_path).write_text(emit_project(nets, seed))
 
     report = {"circ": str(Path(out_path).resolve()), "circuits": {}}
+    if merging:
+        report["merged_into_existing"] = True
     ok = True
     jar = None
     if not args.skip_sim:
@@ -1575,21 +1840,46 @@ def cmd_build(args) -> int:
 
     for c, net in zip(circuits, nets):
         entry = {"gates": len(net.gates)}
+        if net.insts:
+            entry["instances"] = len(net.insts)
         s = structural_check(out_path, net)
         entry["structural"] = s
         ok &= s["ok"]
         if jar:
             try:
-                b = behavioral_check(jar, out_path, c)
+                b = behavioral_check(jar, out_path, c, defs=defs)
                 entry["behavioral"] = b
                 ok &= b["ok"]
-            except ValueError as e:  # switch-driven output without a spec
+            except ValueError as e:  # non-evaluable output without a spec
                 entry["behavioral"] = {"skipped": str(e)}
         report["circuits"][c.name] = entry
     if jar:
         l = load_check(jar, out_path)
         report["load"] = l
         ok &= l["ok"]
+    report["ok"] = ok
+    print(json.dumps(report, indent=2))
+    return 0 if ok else 1
+
+
+def cmd_verify(args) -> int:
+    """Verify circuits inside an existing .circ (hand-drawn or generated)
+    against golden models in a .logic spec file. Spec block names must match
+    circuit names in the file; pin labels must match inputs/outputs."""
+    circuits = parse_logic(Path(args.spec).read_text())
+    defs = {c.name: c for c in circuits}
+    sel = [c for c in circuits if not args.circuit or c.name == args.circuit]
+    if not sel:
+        print(json.dumps({"ok": False,
+                          "error": f"spec has no circuit {args.circuit!r}"}))
+        return 1
+    jar = find_jar(args.jar)
+    report = {"circ": str(Path(args.circ).resolve()), "circuits": {}}
+    ok = True
+    for c in sel:
+        b = behavioral_check(jar, args.circ, c, defs=defs)
+        report["circuits"][c.name] = b
+        ok &= b["ok"]
     report["ok"] = ok
     print(json.dumps(report, indent=2))
     return 0 if ok else 1
@@ -1625,7 +1915,21 @@ def main(argv=None) -> int:
     b.add_argument("--jar", help="path to logisim-evolution jar")
     b.add_argument("--skip-sim", action="store_true",
                    help="structural check only (no java)")
+    b.add_argument("--merge", action="store_true",
+                   help="add/replace circuits inside an existing output file, "
+                        "keeping its other circuits (enables `use` of them)")
+    b.add_argument("--lib", action="append",
+                   help=".logic file(s) providing golden models for circuits "
+                        "instanced from a merge target (repeatable)")
     b.set_defaults(fn=cmd_build)
+
+    v = sub.add_parser("verify", help="verify an existing .circ against a .logic spec")
+    v.add_argument("circ")
+    v.add_argument("--spec", required=True,
+                   help=".logic file with golden models (spec/assign lines)")
+    v.add_argument("--circuit", help="verify only this circuit")
+    v.add_argument("--jar")
+    v.set_defaults(fn=cmd_verify)
 
     ck = sub.add_parser("check", help="verify an existing .circ structurally + load")
     ck.add_argument("circ")

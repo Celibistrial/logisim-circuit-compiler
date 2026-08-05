@@ -46,6 +46,23 @@ circuit full_adder:
 - Multiple `circuit` blocks per file; the first becomes the project's main.
 - 1-bit signals only. No buses, no sequential logic (yet).
 
+### Hierarchy (subcircuit instances)
+
+```
+circuit adder2:
+  inputs A1, A0, B1, B0
+  outputs S1, S0, C
+  use full_adder fa0(A=A0, B=B0, Cin=0) -> (S=S0, Cout=c0)
+  use full_adder fa1(A=A1, B=B1, Cin=c0) -> (S=S1, Cout=c1)
+  C = c1
+```
+
+`use CIRC label(In=sig,...) -> (Out=sig,...)` places CIRC as a subcircuit
+box. CIRC must be defined earlier in the file or already exist in a
+`--merge` target. All input pins must be wired (constants `0`/`1` allowed);
+outputs may be left off. Box port geometry is transcribed from Logisim's
+DefaultEvolutionAppearance and proven by the behavioral layer.
+
 ### Switch-level primitives (transistors)
 
 ```
@@ -78,9 +95,13 @@ pullup Y  /  pulldown Y # pull resistor to 1 / 0
 
 | Command | Does |
 |---|---|
-| `build SRC [-o OUT] [--jar J] [--skip-sim]` | compile + all 3 verification layers, JSON report |
+| `build SRC [-o OUT] [--merge] [--lib L.logic] [--jar J] [--skip-sim]` | compile + all 3 verification layers, JSON report |
+| `verify FILE.circ --spec SPEC.logic [--circuit NAME]` | test ANY .circ (incl. hand-drawn) against golden models |
 | `check FILE.circ` | structural + load check of an existing file |
 | `describe FILE.circ` | JSON netlist summary (pins, components, nets) |
+
+`--merge` adds/replaces circuits inside an existing .circ, keeping everything
+else in it — and new circuits may instance the file's existing circuits.
 
 Jar discovery: `--jar`, `$LOGISIM_JAR`, then
 `/Applications/Logisim-evolution.app/Contents/app/logisim-evolution-*.jar`.
@@ -143,5 +164,5 @@ python3 test_circuitc.py   # geometry, parser, roundtrip, sabotage-detection, si
 - Buses / multi-bit signals — add a width syntax + splitters when needed.
 - Sequential logic (registers, clocks, cross-coupled latches) — needs
   `--test-circuit` benches instead of vectors.
-- Rotated/foreign transistor orientations in `check`/`describe` — the analyzer
-  models the (default) east-facing layout this tool emits and refuses others.
+- Instances inside switch-level (FET) circuits — keep `use` and transistors
+  in separate circuits.

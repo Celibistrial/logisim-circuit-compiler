@@ -1,0 +1,13 @@
+# 1-bit full adder, then a 2-bit ripple adder built from two instances of it
+circuit full_adder:
+  inputs A, B, Cin
+  outputs S, Cout
+  AxB = A ^ B
+  S = AxB ^ Cin
+  Cout = (A & B) | (Cin & AxB)
+
+circuit adder2:
+  inputs A1, A0, B1, B0
+  outputs S1, S0, C
+  use full_adder fa0(A=A0, B=B0, Cin=0) -> (S=S0, Cout=c0)
+  use full_adder fa1(A=A1, B=B1, Cin=c0) -> (S=S1, Cout=C)
