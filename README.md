@@ -103,6 +103,10 @@ pullup Y  /  pulldown Y # pull resistor to 1 / 0
 `--merge` adds/replaces circuits inside an existing .circ, keeping everything
 else in it — and new circuits may instance the file's existing circuits.
 
+`--skip-sim` skips the behavioral layer (useful when no Logisim jar is
+available). The structural check still runs, so the circuit is guaranteed
+electrically correct — just not simulated exhaustively.
+
 Jar discovery: `--jar`, `$LOGISIM_JAR`, then
 `/Applications/Logisim-evolution.app/Contents/app/logisim-evolution-*.jar`.
 
@@ -154,6 +158,16 @@ emitted file against them.
    shorted/floating port — fix the `.logic`, rebuild.
 
 ## Test
+
+```bash
+python3 test_circuitc.py   # geometry, parser, roundtrip, sabotage-detection, sim
+```
+
+## Further documentation
+
+- [DEVELOPMENT.md](DEVELOPMENT.md) — architecture, data structures, layout
+  engines, verification layers, adding new features.
+- [AGENTS.md](AGENTS.md) — concise instructions for LLM agents using this tool.
 
 ```bash
 python3 test_circuitc.py   # geometry, parser, roundtrip, sabotage-detection, sim
