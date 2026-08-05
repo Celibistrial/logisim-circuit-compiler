@@ -1,0 +1,7 @@
+# 1-bit full adder
+circuit full_adder:
+  inputs A, B, Cin
+  outputs S, Cout
+  AxB = A ^ B
+  S = AxB ^ Cin
+  Cout = (A & B) | (Cin & AxB)

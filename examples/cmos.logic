@@ -1,0 +1,35 @@
+# CMOS inverter: 2 transistors
+circuit cmos_inv:
+  inputs A
+  outputs Y
+  spec Y = ~A
+  pmos A: VDD -> Y
+  nmos A: GND -> Y
+
+# CMOS NAND: 4 transistors
+circuit cmos_nand:
+  inputs A, B
+  outputs Y
+  spec Y = ~(A & B)
+  pmos A: VDD -> Y
+  pmos B: VDD -> Y
+  nmos A: GND -> n1
+  nmos B: n1 -> Y
+
+# transmission-gate 2:1 mux (needs complementary select — built with a gate)
+circuit tgate_mux:
+  inputs S, D0, D1
+  outputs Y
+  Sn = ~S
+  spec Y = (S & D1) | (Sn & D0)
+  tgate S, Sn: D1 -> Y
+  tgate Sn, S: D0 -> Y
+
+# pseudo-NMOS NOR: pull-up resistor + 2 N-FETs
+circuit pseudo_nor:
+  inputs A, B
+  outputs Y
+  spec Y = ~(A | B)
+  pullup Y
+  nmos A: GND -> Y
+  nmos B: GND -> Y
