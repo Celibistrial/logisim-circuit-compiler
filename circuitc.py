@@ -1424,34 +1424,20 @@ def _wire_points(a: tuple[int, int], b: tuple[int, int]):
     raise ValueError(f"diagonal wire {a}->{b}")
 
 
-def analyze_circuit_xml(celem) -> dict:
-    """Recompute the netlist Logisim will infer from raw geometry.
+def _ports_of(celem, root=None) -> tuple[list, list]:
+    """Derive every component port's (descr, role, loc) and every tunnel
+    (loc, label) from raw XML — the geometry every checker reasons over.
 
-    Wire semantics (measured against Logisim 4.1.0 simulation):
-      - two wires crossing mid-to-mid do NOT connect;
-      - a wire ENDPOINT landing anywhere on another wire connects (T);
-      - a component port connects to any wire passing through its location.
-    Union-find nodes are wire ids ('w', i) and locations ('p', loc).
-    """
-    uf = _UF()
-    cover: dict = {}   # grid point -> wire ids covering it
-    wires = []
-    for w in celem.findall("wire"):
-        a, b = _parse_loc(w.get("from")), _parse_loc(w.get("to"))
-        i = len(wires)
-        wires.append((a, b))
-        for p in _wire_points(a, b):
-            cover.setdefault(p, []).append(i)
-    for i, (a, b) in enumerate(wires):
-        for end in (a, b):
-            uf.union(("w", i), ("p", end))
-            for j in cover.get(end, ()):  # endpoint touches wire j => same net
-                uf.union(("w", i), ("w", j))
-    wire_pts = set(cover)
-
-    # port lists: (comp_descr, port_role, loc)
-    ports = []
-    tunnels = []  # (loc, label)
+    When ``root`` (the project element) is given, subcircuit instance boxes
+    (comps with no ``lib`` attribute whose name is another circuit) also
+    contribute ports, placed by DefaultEvolutionAppearance fixed-size
+    geometry: west input pins at (-INST_W, 20k), east outputs at (0, 20k),
+    ordered by the referenced circuit's pin order."""
+    registry = {}
+    if root is not None:
+        registry = {c.get("name"): _pin_orders(c) for c in root.findall("circuit")}
+    ports: list = []
+    tunnels: list = []  # (loc, label)
     for comp in celem.findall("comp"):
         name = comp.get("name")
         loc = _parse_loc(comp.get("loc"))
@@ -1490,6 +1476,43 @@ def analyze_circuit_xml(celem) -> dict:
             for i, (dx, dy) in enumerate(ins):
                 ports.append((f"{gid}.in{i}", "sink", (loc[0] + dx, loc[1] + dy)))
             ports.append((f"{gid}.out", "driver", (loc[0] + out[0], loc[1] + out[1])))
+        elif comp.get("lib") is None and name in registry:
+            in_order, out_order = registry[name]
+            label = attrs.get("label", "")
+            gid = f"{name}:{label}" if label else f"{name}@{loc}"
+            for i, p in enumerate(in_order):
+                ports.append((f"{gid}.{p}", "sink", (loc[0] - INST_W, loc[1] + 20 * i)))
+            for j, p in enumerate(out_order):
+                ports.append((f"{gid}.{p}", "driver", (loc[0], loc[1] + 20 * j)))
+    return ports, tunnels
+
+
+def analyze_circuit_xml(celem) -> dict:
+    """Recompute the netlist Logisim will infer from raw geometry.
+
+    Wire semantics (measured against Logisim 4.1.0 simulation):
+      - two wires crossing mid-to-mid do NOT connect;
+      - a wire ENDPOINT landing anywhere on another wire connects (T);
+      - a component port connects to any wire passing through its location.
+    Union-find nodes are wire ids ('w', i) and locations ('p', loc).
+    """
+    uf = _UF()
+    cover: dict = {}   # grid point -> wire ids covering it
+    wires = []
+    for w in celem.findall("wire"):
+        a, b = _parse_loc(w.get("from")), _parse_loc(w.get("to"))
+        i = len(wires)
+        wires.append((a, b))
+        for p in _wire_points(a, b):
+            cover.setdefault(p, []).append(i)
+    for i, (a, b) in enumerate(wires):
+        for end in (a, b):
+            uf.union(("w", i), ("p", end))
+            for j in cover.get(end, ()):  # endpoint touches wire j => same net
+                uf.union(("w", i), ("w", j))
+    wire_pts = set(cover)
+
+    ports, tunnels = _ports_of(celem)
 
     # ports and tunnels connect to every wire passing through their location
     for _, _, loc in ports:
@@ -1775,6 +1798,825 @@ def describe(circ_path: str) -> dict:
 # CLI
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Shared .circ editing / geometry helpers for the analysis + edit commands
+# ---------------------------------------------------------------------------
+
+def _load(path: str):
+    tree = ET.parse(path)
+    return tree, tree.getroot()
+
+
+def _circ(root, name):
+    return next((c for c in root.findall("circuit") if c.get("name") == name), None)
+
+
+def _circ_names(root) -> set:
+    return {c.get("name") for c in root.findall("circuit")}
+
+
+def _wires_of(celem) -> list:
+    return [(_parse_loc(w.get("from")), _parse_loc(w.get("to")))
+            for w in celem.findall("wire")]
+
+
+def _comp_attrs(comp) -> dict:
+    return {a.get("name"): a.get("val") for a in comp.findall("a")}
+
+
+def _instance_comps(celem, names: set) -> list:
+    """Subcircuit instance <comp> elements: no lib attr, name is a circuit."""
+    return [c for c in celem.findall("comp")
+            if c.get("lib") is None and c.get("name") in names]
+
+
+def _net_map(celem, root=None) -> dict:
+    """Union-find over one circuit's geometry (measured Logisim semantics),
+    plus readable net names. Returns {netid(loc), name(root), ports, tunnels,
+    cover, wires}."""
+    wires = _wires_of(celem)
+    uf = _UF()
+    cover: dict = {}
+    for i, (a, b) in enumerate(wires):
+        for p in _wire_points(a, b):
+            cover.setdefault(p, []).append(i)
+    for i, (a, b) in enumerate(wires):
+        for end in (a, b):
+            uf.union(("w", i), ("p", end))
+            for j in cover.get(end, ()):
+                uf.union(("w", i), ("w", j))
+    ports, tunnels = _ports_of(celem, root)
+    for _, _, loc in ports:
+        for j in cover.get(loc, ()):
+            uf.union(("p", loc), ("w", j))
+    label_loc: dict = {}
+    for loc, label in tunnels:
+        for j in cover.get(loc, ()):
+            uf.union(("p", loc), ("w", j))
+        if label in label_loc:
+            uf.union(("p", loc), ("p", label_loc[label]))
+        label_loc[label] = loc
+
+    names: dict = {}  # root -> readable label
+    for loc, label in tunnels:
+        names.setdefault(uf.find(("p", loc)), label)
+    for descr, _, loc in ports:
+        r = uf.find(("p", loc))
+        if descr.startswith("pin:"):
+            names[r] = descr[4:]
+        names.setdefault(r, descr)
+
+    def netid(loc):
+        return uf.find(("p", loc))
+
+    return {"netid": netid, "name": lambda r: names.get(r, str(r)),
+            "ports": ports, "tunnels": tunnels, "cover": cover, "wires": wires}
+
+
+# ---------------------------------------------------------------------------
+# Geometry checkers: grid alignment (#1), proximity (#2), collisions (#8)
+# ---------------------------------------------------------------------------
+
+def _nearest_grid(v: int) -> int:
+    return round(v / GRID) * GRID
+
+
+def check_grid(path: str) -> dict:
+    """Report every component anchor and wire endpoint off the 10px grid."""
+    _, root = _load(path)
+    violations = []
+    for celem in root.findall("circuit"):
+        cname = celem.get("name")
+        for comp in celem.findall("comp"):
+            x, y = _parse_loc(comp.get("loc"))
+            if x % GRID or y % GRID:
+                label = _comp_attrs(comp).get("label", "")
+                violations.append({
+                    "circuit": cname, "component": comp.get("name"),
+                    "label": label, "at": [x, y],
+                    "nearest_grid": [_nearest_grid(x), _nearest_grid(y)],
+                    "kind": "component anchor",
+                })
+        for a, b in _wires_of(celem):
+            for end in (a, b):
+                if end[0] % GRID or end[1] % GRID:
+                    violations.append({
+                        "circuit": cname, "component": "wire",
+                        "label": "", "at": list(end),
+                        "nearest_grid": [_nearest_grid(end[0]), _nearest_grid(end[1])],
+                        "kind": "wire endpoint",
+                    })
+    return {"ok": not violations, "violations": violations}
+
+
+def check_proximity(path: str, threshold: int = GRID) -> dict:
+    """Flag ports that ALMOST touch a wire (within `threshold` px) but make no
+    electrical contact — the classic 'nudged off by one grid line' bug."""
+    _, root = _load(path)
+    near = []
+    for celem in root.findall("circuit"):
+        cname = celem.get("name")
+        nm = _net_map(celem, root)
+        cover = nm["cover"]
+        covered = set(cover)
+        # ports sharing a loc with another port also count as connected
+        loc_count: dict = {}
+        for _, _, loc in nm["ports"]:
+            loc_count[loc] = loc_count.get(loc, 0) + 1
+        for descr, role, loc in nm["ports"]:
+            if loc in covered or loc_count[loc] >= 2:
+                continue  # electrically connected already
+            best = None
+            for p in covered:
+                d = abs(p[0] - loc[0]) + abs(p[1] - loc[1])
+                if d and d <= threshold and (best is None or d < best[0]):
+                    best = (d, p)
+            if best:
+                near.append({
+                    "circuit": cname, "port": descr, "role": role,
+                    "port_at": list(loc), "nearest_wire_point": list(best[1]),
+                    "distance_px": best[0],
+                })
+    return {"ok": not near, "near_misses": near}
+
+
+def check_collision(path: str) -> dict:
+    """Geometry-level short detector. Reports T-junctions (a wire endpoint
+    landing mid-segment — these DO connect in Logisim 4.1.0) and mid-to-mid
+    crossings (these do NOT connect — reported informationally). Nets sharing
+    a physical connection but carrying two different tunnel labels or two hard
+    drivers are flagged as real shorts."""
+    _, root = _load(path)
+    result = {"t_junctions": [], "crossings": [], "shorts": [], "bridged_labels": []}
+    for celem in root.findall("circuit"):
+        cname = celem.get("name")
+        wires = _wires_of(celem)
+        pts = [set(_wire_points(a, b)) for a, b in wires]
+        ends = [(_wire_points(a, b)[0], _wire_points(a, b)[-1]) for a, b in wires]
+        for i, (a, b) in enumerate(wires):
+            for j in range(len(wires)):
+                if i == j:
+                    continue
+                for e in ends[i]:
+                    if e in pts[j] and e not in ends[j]:
+                        result["t_junctions"].append({
+                            "circuit": cname, "at": list(e),
+                            "endpoint_of": [list(a), list(b)],
+                            "lands_on": [list(wires[j][0]), list(wires[j][1])],
+                        })
+            for j in range(i + 1, len(wires)):
+                shared = pts[i] & pts[j]
+                for p in shared:
+                    if p not in ends[i] and p not in ends[j]:
+                        result["crossings"].append({"circuit": cname, "at": list(p)})
+        # real shorts: one physical net driven by >1 hard driver (pin/gate/
+        # constant/power). Label bridging alone is legitimate aliasing, so it
+        # is reported informationally, not as a short.
+        a = analyze_circuit_xml(celem)
+        for grp in a["label_groups"]:
+            result["bridged_labels"].append({"circuit": cname, "labels": grp})
+        for lbl, drv in a["drivers"].items():
+            hard = [d for d, k in drv if k == "hard"]
+            if len(hard) > 1:
+                result["shorts"].append({"circuit": cname, "net": lbl,
+                                         "multiple_drivers": hard})
+    result["ok"] = not result["shorts"]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Hierarchy checkers: pin contract + unconnected inputs (#5, #7)
+# ---------------------------------------------------------------------------
+
+def check_pins(path: str, root=None) -> dict:
+    """Hierarchy-aware: for every subcircuit instance, verify each defined
+    input pin is wired (constant counts) and report unconnected outputs and
+    dangling references. Covers the whole hierarchy (every parent's instances)."""
+    if root is None:
+        _, root = _load(path)
+    names = _circ_names(root)
+    reg = {c.get("name"): _pin_orders(c) for c in root.findall("circuit")}
+    dangling, unwired, unconnected_out = [], [], []
+    for celem in root.findall("circuit"):
+        parent = celem.get("name")
+        nm = _net_map(celem, root)
+        covered = set(nm["cover"])
+        for comp in _instance_comps(celem, names):
+            label = _comp_attrs(comp).get("label", "")
+            circ = comp.get("name")
+            loc = _parse_loc(comp.get("loc"))
+            in_order, out_order = reg[circ]
+            for i, p in enumerate(in_order):
+                if (loc[0] - INST_W, loc[1] + 20 * i) not in covered:
+                    unwired.append({"parent": parent, "instance": label,
+                                    "circuit": circ, "input_pin": p})
+            for j, p in enumerate(out_order):
+                if (loc[0], loc[1] + 20 * j) not in covered:
+                    unconnected_out.append({"parent": parent, "instance": label,
+                                            "circuit": circ, "output_pin": p})
+    # dangling refs (instance points at a missing circuit)
+    for celem in root.findall("circuit"):
+        for comp in celem.findall("comp"):
+            if comp.get("lib") is None and comp.get("name") not in names \
+                    and comp.get("name") not in _CIRC_NAME.values() \
+                    and comp.get("name") not in ("Pin", "Constant", "Tunnel",
+                        "Power", "Ground", "Pull Resistor", "Transistor",
+                        "Transmission Gate", "Clock", "Text"):
+                dangling.append({"parent": celem.get("name"),
+                                 "references": comp.get("name")})
+    return {"ok": not (unwired or dangling),
+            "unwired_inputs": unwired,
+            "unconnected_outputs": unconnected_out,
+            "dangling_references": dangling}
+
+
+# ---------------------------------------------------------------------------
+# Combinational feedback loop detector (#6)
+# ---------------------------------------------------------------------------
+
+def check_loops(path: str) -> dict:
+    """Static feedback-loop detector. Builds a directed net-dependency graph
+    (component input net -> output net) and reports strongly-connected
+    components of size > 1 (or self-loops) — combinational cycles that make
+    Logisim oscillate. Cross-coupled NAND/NOR pairs are flagged as likely
+    intentional latches."""
+    _, root = _load(path)
+    loops = []
+    for celem in root.findall("circuit"):
+        cname = celem.get("name")
+        nm = _net_map(celem, root)
+        # group ports by owning component
+        comps: dict = {}
+        for descr, role, loc in nm["ports"]:
+            if descr.startswith("pin:") or descr.startswith("const@") \
+                    or descr.startswith("Power@") or descr.startswith("Ground@"):
+                continue  # sources/sinks at the boundary, not logic
+            cid = descr.rsplit(".", 1)[0]
+            comps.setdefault(cid, {"in": set(), "out": set()})
+            side = "out" if role.endswith("driver") else "in"
+            comps[cid][side].add(nm["netid"](loc))
+        edges: dict = {}
+        comp_of_edge: dict = {}
+        for cid, io in comps.items():
+            for s in io["in"]:
+                for d in io["out"]:
+                    edges.setdefault(s, set()).add(d)
+                    comp_of_edge.setdefault((s, d), []).append(cid)
+        for scc in _sccs(edges):
+            self_loop = len(scc) == 1 and any(n in edges.get(n, ()) for n in scc)
+            if len(scc) > 1 or self_loop:
+                comps_in = sorted({c for e, cs in comp_of_edge.items()
+                                   if e[0] in scc and e[1] in scc for c in cs})
+                kinds = {c.split("@")[0].split(":")[0] for c in comps_in}
+                latch = len(comps_in) >= 2 and kinds <= {"NAND"} or kinds <= {"NOR"}
+                loops.append({
+                    "circuit": cname,
+                    "nets": sorted(nm["name"](n) for n in scc),
+                    "components": comps_in,
+                    "likely_intentional_latch": bool(latch and len(comps_in) >= 2),
+                })
+    return {"ok": not loops, "loops": loops}
+
+
+def _sccs(edges: dict) -> list:
+    """Tarjan's SCC over an adjacency dict; iterative to survive deep graphs."""
+    index: dict = {}
+    low: dict = {}
+    on_stack: set = set()
+    stack: list = []
+    out: list = []
+    counter = [0]
+    nodes = set(edges) | {d for ds in edges.values() for d in ds}
+    for start in nodes:
+        if start in index:
+            continue
+        work = [(start, iter(edges.get(start, ())))]
+        index[start] = low[start] = counter[0]; counter[0] += 1
+        stack.append(start); on_stack.add(start)
+        while work:
+            node, it = work[-1]
+            advanced = False
+            for w in it:
+                if w not in index:
+                    index[w] = low[w] = counter[0]; counter[0] += 1
+                    stack.append(w); on_stack.add(w)
+                    work.append((w, iter(edges.get(w, ()))))
+                    advanced = True
+                    break
+                elif w in on_stack:
+                    low[node] = min(low[node], index[w])
+            if advanced:
+                continue
+            if low[node] == index[node]:
+                comp = []
+                while True:
+                    m = stack.pop(); on_stack.discard(m); comp.append(m)
+                    if m == node:
+                        break
+                out.append(comp)
+            work.pop()
+            if work:
+                low[work[-1][0]] = min(low[work[-1][0]], low[node])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Golden-model / exhaustive testing of any .circ (#3, #4)
+# ---------------------------------------------------------------------------
+
+def cmd_test(args) -> int:
+    _, root = _load(args.circ)
+    names = _circ_names(root)
+    targets = [args.circuit] if args.circuit else sorted(names)
+    report = {"circ": str(Path(args.circ).resolve()), "circuits": {}}
+    ok = True
+    defs = {}
+    if args.spec:
+        for c in parse_logic(Path(args.spec).read_text()):
+            defs[c.name] = c
+    jar = None
+    try:
+        jar = find_jar(args.jar)
+    except FileNotFoundError as e:
+        report["warning"] = str(e)
+    for name in targets:
+        celem = _circ(root, name)
+        if celem is None:
+            report["circuits"][name] = {"ok": False, "error": "not found"}
+            ok = False
+            continue
+        pins_in, pins_out = _pin_orders(celem)
+        entry = {"inputs": pins_in, "outputs": pins_out}
+        if name in defs and jar:
+            c = defs[name]
+            b = behavioral_check(jar, args.circ, c, defs=defs)
+            entry["behavioral"] = b
+            ok &= b["ok"]
+        else:
+            a = analyze_circuit_xml(celem)
+            entry["structural_errors"] = a["floating"]
+            if name in defs and not jar:
+                entry["note"] = "spec supplied but no jar; ran structural only"
+            elif not defs:
+                entry["note"] = "no --spec: structural + load check only"
+            ok &= not a["floating"]
+        report["circuits"][name] = entry
+    if jar:
+        report["load"] = load_check(jar, args.circ)
+        ok &= report["load"]["ok"]
+    report["ok"] = ok
+    print(json.dumps(report, indent=2))
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# Circuit-level edits: delete / rename / clone / extract (#9, #10, #11)
+# ---------------------------------------------------------------------------
+
+def _rewrite(tree, path: str):
+    tree.write(path, encoding="UTF-8", xml_declaration=True)
+
+
+def cmd_delete(args) -> int:
+    tree, root = _load(args.circ)
+    names = _circ_names(root)
+    deleted, missing = [], []
+    for n in args.names:
+        (deleted if n in names else missing).append(n)
+    still_referenced = []
+    for celem in root.findall("circuit"):
+        if celem.get("name") in deleted:
+            continue
+        for comp in _instance_comps(celem, names):
+            if comp.get("name") in deleted:
+                still_referenced.append({"parent": celem.get("name"),
+                                         "circuit": comp.get("name")})
+    report = {"deleted": deleted, "not_found": missing,
+              "dry_run": args.dry_run,
+              "would_dangle": still_referenced}
+    if not args.dry_run and deleted:
+        for celem in list(root.findall("circuit")):
+            if celem.get("name") in deleted:
+                root.remove(celem)
+        main = root.find("main")
+        if main is not None and main.get("name") in deleted:
+            remaining = root.findall("circuit")
+            if remaining:
+                main.set("name", remaining[0].get("name"))
+        _rewrite(tree, args.circ)
+    report["ok"] = True
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def cmd_rename(args) -> int:
+    tree, root = _load(args.circ)
+    names = _circ_names(root)
+    if args.old not in names:
+        print(json.dumps({"ok": False, "error": f"circuit {args.old!r} not found"}))
+        return 1
+    if args.new in names:
+        print(json.dumps({"ok": False, "error": f"circuit {args.new!r} already exists"}))
+        return 1
+    celem = _circ(root, args.old)
+    celem.set("name", args.new)
+    for a in celem.findall("a"):
+        if a.get("name") == "circuit":
+            a.set("val", args.new)
+    updated = []
+    for other in root.findall("circuit"):
+        for comp in _instance_comps(other, names):
+            if comp.get("name") == args.old:
+                comp.set("name", args.new)
+                updated.append(other.get("name"))
+    main = root.find("main")
+    if main is not None and main.get("name") == args.old:
+        main.set("name", args.new)
+    _rewrite(tree, args.circ)
+    print(json.dumps({"ok": True, "renamed": [args.old, args.new],
+                      "instances_updated": len(updated),
+                      "in_circuits": sorted(set(updated))}, indent=2))
+    return 0
+
+
+def cmd_clone(args) -> int:
+    import copy
+    tree, root = _load(args.circ)
+    names = _circ_names(root)
+    if args.source not in names:
+        print(json.dumps({"ok": False, "error": f"circuit {args.source!r} not found"}))
+        return 1
+    if args.new in names:
+        print(json.dumps({"ok": False, "error": f"circuit {args.new!r} already exists"}))
+        return 1
+    clone = copy.deepcopy(_circ(root, args.source))
+    clone.set("name", args.new)
+    for a in clone.findall("a"):
+        if a.get("name") == "circuit":
+            a.set("val", args.new)
+    clone.tail = "\n"
+    root.append(clone)
+    _rewrite(tree, args.circ)
+    print(json.dumps({"ok": True, "cloned": [args.source, args.new]}, indent=2))
+    return 0
+
+
+def _deps_of(root, name: str, names: set, seen: set):
+    """Transitive set of circuits referenced (via instances) by `name`."""
+    seen.add(name)
+    celem = _circ(root, name)
+    if celem is None:
+        return
+    for comp in _instance_comps(celem, names):
+        ref = comp.get("name")
+        if ref not in seen:
+            _deps_of(root, ref, names, seen)
+
+
+def cmd_extract(args) -> int:
+    import copy
+    _, root = _load(args.circ)
+    names = _circ_names(root)
+    missing = [n for n in args.names if n not in names]
+    if missing:
+        print(json.dumps({"ok": False, "error": f"circuit(s) not found: {missing}"}))
+        return 1
+    keep = list(args.names)
+    warned = []
+    if not args.no_deps:
+        seen: set = set()
+        for n in args.names:
+            _deps_of(root, n, names, seen)
+        for d in sorted(seen):
+            if d not in keep:
+                keep.append(d)
+    else:
+        for n in args.names:
+            seen2: set = set()
+            _deps_of(root, n, names, seen2)
+            warned += [d for d in seen2 if d not in args.names]
+    new_root = copy.deepcopy(root)
+    keepset = set(keep)
+    for celem in list(new_root.findall("circuit")):
+        if celem.get("name") not in keepset:
+            new_root.remove(celem)
+    main = new_root.find("main")
+    if main is not None:
+        main.set("name", args.names[0])
+    ET.ElementTree(new_root).write(args.output, encoding="UTF-8", xml_declaration=True)
+    print(json.dumps({"ok": True, "extracted": keep, "main": args.names[0],
+                      "output": str(Path(args.output).resolve()),
+                      "missing_deps_skipped": sorted(set(warned))}, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Interface edits: add-pin / remove-pin (#12)
+# ---------------------------------------------------------------------------
+
+def cmd_add_pin(args) -> int:
+    tree, root = _load(args.circ)
+    celem = _circ(root, args.circuit)
+    if celem is None:
+        print(json.dumps({"ok": False, "error": f"circuit {args.circuit!r} not found"}))
+        return 1
+    pins_in, pins_out = _pin_orders(celem)
+    if args.pin in (pins_in if args.direction == "in" else pins_out):
+        print(json.dumps({"ok": False, "error": f"pin {args.pin!r} already exists"}))
+        return 1
+    # place below the lowest existing pin of that direction
+    ys = [_parse_loc(c.get("loc"))[1] for c in celem.findall("comp")
+          if c.get("name") == "Pin"]
+    y = (max(ys) + 20) if ys else 60
+    x = 60 if args.direction == "in" else 300
+    comp = ET.SubElement(celem, "comp")
+    comp.set("lib", "0"); comp.set("name", "Pin")
+    comp.set("loc", f"({x},{y})")
+    a1 = ET.SubElement(comp, "a"); a1.set("name", "appearance"); a1.set("val", "classic")
+    if args.direction == "out":
+        af = ET.SubElement(comp, "a"); af.set("name", "facing"); af.set("val", "west")
+        at = ET.SubElement(comp, "a"); at.set("name", "type"); at.set("val", "output")
+    al = ET.SubElement(comp, "a"); al.set("name", "label"); al.set("val", args.pin)
+    comp.tail = "\n    "
+    _rewrite(tree, args.circ)
+    print(json.dumps({"ok": True, "added_pin": args.pin,
+                      "direction": args.direction, "at": [x, y],
+                      "note": "pin is floating until wired; instance boxes "
+                              "regenerate automatically on load in Logisim"},
+                     indent=2))
+    return 0
+
+
+def cmd_remove_pin(args) -> int:
+    tree, root = _load(args.circ)
+    celem = _circ(root, args.circuit)
+    if celem is None:
+        print(json.dumps({"ok": False, "error": f"circuit {args.circuit!r} not found"}))
+        return 1
+    target = None
+    for comp in celem.findall("comp"):
+        if comp.get("name") == "Pin" and _comp_attrs(comp).get("label") == args.pin:
+            target = comp
+            break
+    if target is None:
+        print(json.dumps({"ok": False, "error": f"pin {args.pin!r} not found"}))
+        return 1
+    loc = _parse_loc(target.get("loc"))
+    celem.remove(target)
+    removed_wires = 0
+    for w in list(celem.findall("wire")):
+        if _parse_loc(w.get("from")) == loc or _parse_loc(w.get("to")) == loc:
+            celem.remove(w)
+            removed_wires += 1
+    _rewrite(tree, args.circ)
+    print(json.dumps({"ok": True, "removed_pin": args.pin,
+                      "wires_removed": removed_wires,
+                      "warning": (f"{removed_wires} attached wire(s) removed; "
+                                  "internal logic may now be undriven")
+                                 if removed_wires else None}, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Reference maintenance: fix-refs / replace-ref (#13)
+# ---------------------------------------------------------------------------
+
+def cmd_fix_refs(args) -> int:
+    import difflib
+    tree, root = _load(args.circ)
+    names = _circ_names(root)
+    known_prims = {"Pin", "Constant", "Tunnel", "Power", "Ground", "Pull Resistor",
+                   "Transistor", "Transmission Gate", "Clock", "Text",
+                   "Splitter", "Probe", "Button", "LED"} | set(_CIRC_NAME.values())
+    dangling = []
+    for celem in root.findall("circuit"):
+        for comp in celem.findall("comp"):
+            ref = comp.get("name")
+            if comp.get("lib") is None and ref not in names and ref not in known_prims:
+                dangling.append((celem, comp))
+    report = {"dangling": [], "auto": args.auto, "removed": 0, "replaced": 0}
+    for celem, comp in dangling:
+        ref = comp.get("name")
+        entry = {"parent": celem.get("name"), "references": ref,
+                 "at": list(_parse_loc(comp.get("loc"))),
+                 "suggestions": difflib.get_close_matches(ref, names, n=3)}
+        report["dangling"].append(entry)
+        if args.auto:
+            if args.replace_with and args.replace_with in names:
+                comp.set("name", args.replace_with)
+                report["replaced"] += 1
+            else:
+                celem.remove(comp)
+                report["removed"] += 1
+    if args.auto and dangling:
+        _rewrite(tree, args.circ)
+    report["ok"] = args.auto or not dangling
+    print(json.dumps(report, indent=2))
+    return 0 if report["ok"] else 1
+
+
+def cmd_replace_ref(args) -> int:
+    tree, root = _load(args.circ)
+    names = _circ_names(root)
+    if args.new not in names:
+        print(json.dumps({"ok": False, "error": f"circuit {args.new!r} not found"}))
+        return 1
+    warning = None
+    if args.old in names:
+        if _pin_orders(_circ(root, args.old)) != _pin_orders(_circ(root, args.new)):
+            warning = "pin interfaces differ; existing wiring may break"
+    updated = []
+    for celem in root.findall("circuit"):
+        for comp in celem.findall("comp"):
+            if comp.get("lib") is None and comp.get("name") == args.old:
+                comp.set("name", args.new)
+                updated.append(celem.get("name"))
+    _rewrite(tree, args.circ)
+    print(json.dumps({"ok": True, "replaced": [args.old, args.new],
+                      "instances_updated": len(updated),
+                      "in_circuits": sorted(set(updated)),
+                      "warning": warning}, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Flatten hierarchy (#14)
+# ---------------------------------------------------------------------------
+
+def _flatten_instance(parent, child, comp, offset, root):
+    """Inline `comp` (an instance of `child`) into `parent`. Bridges nets with
+    tunnels: each instance port loc gets a tunnel, each child boundary Pin
+    becomes the matching tunnel — electrically exact, geometry-trivial."""
+    import copy
+    label = _comp_attrs(comp).get("label") or f"inst{id(comp) % 1000}"
+    loc = _parse_loc(comp.get("loc"))
+    in_order, out_order = _pin_orders(child)
+
+    def tlabel(pin):
+        return f"{label}__{pin}"
+
+    def add_tunnel(where, lab):
+        t = ET.SubElement(parent, "comp")
+        t.set("lib", "0"); t.set("name", "Tunnel")
+        t.set("loc", f"({where[0]},{where[1]})")
+        a = ET.SubElement(t, "a"); a.set("name", "label"); a.set("val", lab)
+        t.tail = "\n    "
+
+    # bridge tunnels at the (removed) instance's port locations
+    for i, p in enumerate(in_order):
+        add_tunnel((loc[0] - INST_W, loc[1] + 20 * i), tlabel(p))
+    for j, p in enumerate(out_order):
+        add_tunnel((loc[0], loc[1] + 20 * j), tlabel(p))
+    parent.remove(comp)
+
+    ox, oy = offset
+    for cc in child.findall("comp"):
+        name = cc.get("name")
+        cloc = _parse_loc(cc.get("loc"))
+        attrs = _comp_attrs(cc)
+        if name == "Pin":  # boundary pin -> bridge tunnel at same (offset) loc
+            add_tunnel((cloc[0] + ox, cloc[1] + oy), tlabel(attrs.get("label", "?")))
+            continue
+        el = copy.deepcopy(cc)
+        el.set("loc", f"({cloc[0] + ox},{cloc[1] + oy})")
+        for a in el.findall("a"):
+            if a.get("name") == "label" and a.get("val"):
+                a.set("val", f"{label}/{a.get('val')}")
+        el.tail = "\n    "
+        parent.append(el)
+    for w in child.findall("wire"):
+        a, b = _parse_loc(w.get("from")), _parse_loc(w.get("to"))
+        nw = ET.SubElement(parent, "wire")
+        nw.set("from", f"({a[0] + ox},{a[1] + oy})")
+        nw.set("to", f"({b[0] + ox},{b[1] + oy})")
+        nw.tail = "\n    "
+
+
+def cmd_flatten(args) -> int:
+    tree, root = _load(args.circ)
+    names = _circ_names(root)
+    parent = _circ(root, args.parent)
+    if parent is None:
+        print(json.dumps({"ok": False, "error": f"circuit {args.parent!r} not found"}))
+        return 1
+    flattened = []
+    for _ in range(args.depth):
+        insts = _instance_comps(parent, names)
+        if args.label and not args.all:
+            insts = [c for c in insts if _comp_attrs(c).get("label") == args.label]
+        if not insts:
+            break
+        # offset each inlined block below the current parent bbox
+        ys = [_parse_loc(c.get("loc"))[1] for c in parent.findall("comp")]
+        ys += [e[1] for a, b in _wires_of(parent) for e in (a, b)]
+        base_y = (max(ys, default=100) // GRID + 20) * GRID
+        for k, comp in enumerate(list(insts)):
+            child = _circ(root, comp.get("name"))
+            if child is None:
+                continue
+            _flatten_instance(parent, child, comp, (200, base_y + k * 400), root)
+            flattened.append(_comp_attrs(comp).get("label", comp.get("name")))
+        if not args.all and args.label:
+            break  # one specific instance, one pass
+    out = args.output or args.circ
+    _rewrite(tree, out) if out == args.circ else \
+        ET.ElementTree(root).write(out, encoding="UTF-8", xml_declaration=True)
+    print(json.dumps({"ok": True, "flattened": flattened,
+                      "output": str(Path(out).resolve())}, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Circuit diff (#15)
+# ---------------------------------------------------------------------------
+
+def _circ_signature(celem, root) -> dict:
+    pins_in, pins_out = _pin_orders(celem)
+    comps: dict = {}
+    insts = []
+    names = _circ_names(root)
+    for comp in celem.findall("comp"):
+        nm = comp.get("name")
+        if comp.get("lib") is None and nm in names:
+            insts.append((nm, _comp_attrs(comp).get("label", "")))
+        elif nm != "Text":
+            comps[nm] = comps.get(nm, 0) + 1
+    a = analyze_circuit_xml(celem)
+    return {"inputs": pins_in, "outputs": pins_out, "components": comps,
+            "instances": sorted(insts),
+            "drivers": {k: sorted(d for d, _ in v) for k, v in a["drivers"].items()},
+            "n_wires": len(celem.findall("wire"))}
+
+
+def cmd_diff(args) -> int:
+    _, ra = _load(args.file_a)
+    _, rb = _load(args.file_b)
+    na, nb = _circ_names(ra), _circ_names(rb)
+    diff = {"circuits_added": sorted(nb - na),
+            "circuits_removed": sorted(na - nb),
+            "changed": {}}
+    common = sorted(na & nb) if not args.circuit else [args.circuit]
+    for name in common:
+        ca, cb = _circ(ra, name), _circ(rb, name)
+        if ca is None or cb is None:
+            continue
+        sa, sb = _circ_signature(ca, ra), _circ_signature(cb, rb)
+        d = {}
+        if sa["inputs"] != sb["inputs"]:
+            d["inputs"] = {"before": sa["inputs"], "after": sb["inputs"]}
+        if sa["outputs"] != sb["outputs"]:
+            d["outputs"] = {"before": sa["outputs"], "after": sb["outputs"]}
+        if sa["components"] != sb["components"]:
+            keys = set(sa["components"]) | set(sb["components"])
+            d["components"] = {k: [sa["components"].get(k, 0), sb["components"].get(k, 0)]
+                               for k in sorted(keys)
+                               if sa["components"].get(k) != sb["components"].get(k)}
+        if sa["instances"] != sb["instances"]:
+            d["instances"] = {"before": sa["instances"], "after": sb["instances"]}
+        if sa["drivers"] != sb["drivers"]:
+            d["nets"] = {"before": sa["drivers"], "after": sb["drivers"]}
+        if sa["n_wires"] != sb["n_wires"]:
+            d["wire_count"] = [sa["n_wires"], sb["n_wires"]]
+        if d:
+            diff["changed"][name] = d
+    # rename heuristic: removed+added with identical interface & component sig
+    renamed = []
+    for rem in list(diff["circuits_removed"]):
+        sr = _circ_signature(_circ(ra, rem), ra)
+        for add in list(diff["circuits_added"]):
+            sad = _circ_signature(_circ(rb, add), rb)
+            if (sr["inputs"], sr["outputs"], sr["components"]) == \
+               (sad["inputs"], sad["outputs"], sad["components"]):
+                renamed.append([rem, add])
+                diff["circuits_removed"].remove(rem)
+                diff["circuits_added"].remove(add)
+                break
+    diff["circuits_renamed"] = renamed
+    diff["ok"] = not (diff["circuits_added"] or diff["circuits_removed"]
+                      or diff["changed"] or renamed)
+    if args.text:
+        _print_diff_text(diff)
+    else:
+        print(json.dumps(diff, indent=2))
+    return 0
+
+
+def _print_diff_text(diff: dict):
+    if diff["ok"]:
+        print("no differences")
+        return
+    for n in diff["circuits_added"]:
+        print(f"+ circuit {n}")
+    for n in diff["circuits_removed"]:
+        print(f"- circuit {n}")
+    for a, b in diff["circuits_renamed"]:
+        print(f"~ circuit {a} -> {b}")
+    for name, d in diff["changed"].items():
+        print(f"* circuit {name}:")
+        for k, v in d.items():
+            print(f"    {k}: {v}")
+
+
 def _merge_into(out_path: str, nets: list[Netlist]) -> None:
     """Splice built circuits into an existing .circ, preserving everything
     else (other circuits, custom skeleton, main). Same-named circuits are
@@ -1939,6 +2781,113 @@ def main(argv=None) -> int:
     d = sub.add_parser("describe", help="JSON netlist summary of a .circ")
     d.add_argument("circ")
     d.set_defaults(fn=cmd_describe)
+
+    # ---- analysis checkers (operate on any .circ) ----
+    def _checker(fn):
+        def run(args):
+            r = fn(args.circ, *([args.threshold] if hasattr(args, "threshold") else []))
+            print(json.dumps(r, indent=2))
+            return 0 if r["ok"] else 1
+        return run
+
+    cg = sub.add_parser("check-grid", help="report off-10px-grid coords (#1)")
+    cg.add_argument("circ")
+    cg.set_defaults(fn=_checker(check_grid))
+
+    cp = sub.add_parser("check-proximity", help="ports that almost touch a wire (#2)")
+    cp.add_argument("circ")
+    cp.add_argument("--threshold", type=int, default=GRID,
+                    help="max near-miss distance in px (default 10)")
+    cp.set_defaults(fn=_checker(check_proximity))
+
+    cc = sub.add_parser("check-collision", help="wire T-junctions/crossings/shorts (#8)")
+    cc.add_argument("circ")
+    cc.set_defaults(fn=_checker(check_collision))
+
+    cpin = sub.add_parser("check-pins",
+                          help="hierarchy-aware pin contract + unconnected inputs (#5,#7)")
+    cpin.add_argument("circ")
+    cpin.set_defaults(fn=_checker(check_pins))
+
+    cl = sub.add_parser("check-loops", help="combinational feedback loop detector (#6)")
+    cl.add_argument("circ")
+    cl.set_defaults(fn=_checker(check_loops))
+
+    # ---- golden-model / exhaustive test of any .circ (#3, #4) ----
+    t = sub.add_parser("test", help="truth-table validate any .circ (#3,#4)")
+    t.add_argument("circ")
+    t.add_argument("--circuit", help="test only this circuit")
+    t.add_argument("--spec", help=".logic golden model (spec/assign lines)")
+    t.add_argument("--jar")
+    t.set_defaults(fn=cmd_test)
+
+    # ---- circuit-level edits ----
+    dl = sub.add_parser("delete", help="delete circuits from a .circ (#9)")
+    dl.add_argument("circ")
+    dl.add_argument("names", nargs="+")
+    dl.add_argument("--dry-run", action="store_true")
+    dl.set_defaults(fn=cmd_delete)
+
+    rn = sub.add_parser("rename", help="rename a circuit, updating references (#10)")
+    rn.add_argument("circ")
+    rn.add_argument("old")
+    rn.add_argument("new")
+    rn.set_defaults(fn=cmd_rename)
+
+    cln = sub.add_parser("clone", help="duplicate a circuit under a new name (#10)")
+    cln.add_argument("circ")
+    cln.add_argument("source")
+    cln.add_argument("new")
+    cln.set_defaults(fn=cmd_clone)
+
+    ex = sub.add_parser("extract", help="extract circuits (+deps) to a new .circ (#11)")
+    ex.add_argument("circ")
+    ex.add_argument("names", nargs="+")
+    ex.add_argument("-o", "--output", required=True)
+    ex.add_argument("--no-deps", action="store_true")
+    ex.set_defaults(fn=cmd_extract)
+
+    ap_ = sub.add_parser("add-pin", help="add a pin to a circuit interface (#12)")
+    ap_.add_argument("circ")
+    ap_.add_argument("circuit")
+    ap_.add_argument("pin")
+    ap_.add_argument("--direction", choices=["in", "out"], required=True)
+    ap_.set_defaults(fn=cmd_add_pin)
+
+    rp = sub.add_parser("remove-pin", help="remove a pin from a circuit (#12)")
+    rp.add_argument("circ")
+    rp.add_argument("circuit")
+    rp.add_argument("pin")
+    rp.set_defaults(fn=cmd_remove_pin)
+
+    fr = sub.add_parser("fix-refs", help="find/fix dangling subcircuit refs (#13)")
+    fr.add_argument("circ")
+    fr.add_argument("--auto", action="store_true",
+                    help="remove orphaned instances (or replace, see --replace-with)")
+    fr.add_argument("--replace-with", help="circuit to point dangling instances at")
+    fr.set_defaults(fn=cmd_fix_refs)
+
+    rr = sub.add_parser("replace-ref", help="bulk-replace instance references (#13)")
+    rr.add_argument("circ")
+    rr.add_argument("old")
+    rr.add_argument("new")
+    rr.set_defaults(fn=cmd_replace_ref)
+
+    fl = sub.add_parser("flatten", help="inline subcircuit instances (#14)")
+    fl.add_argument("circ")
+    fl.add_argument("parent")
+    fl.add_argument("label", nargs="?", help="instance label to inline (omit with --all)")
+    fl.add_argument("--all", action="store_true", help="flatten every instance")
+    fl.add_argument("--depth", type=int, default=1, help="levels to flatten")
+    fl.add_argument("-o", "--output")
+    fl.set_defaults(fn=cmd_flatten)
+
+    df = sub.add_parser("diff", help="structural diff of two .circ files (#15)")
+    df.add_argument("file_a")
+    df.add_argument("file_b")
+    df.add_argument("--circuit", help="diff only this circuit")
+    df.add_argument("--text", action="store_true", help="human-readable output")
+    df.set_defaults(fn=cmd_diff)
 
     args = ap.parse_args(argv)
     try:

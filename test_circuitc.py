@@ -562,6 +562,197 @@ def test_merge_workflow():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# New commands (issues #1–#15) — structural, no jar required
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build(td, src, name="t.circ"):
+    logic = Path(td) / "src.logic"
+    logic.write_text(src)
+    out = Path(td) / name
+    run_circuitc("build", str(logic), "-o", str(out), "--skip-sim")
+    return out
+
+OFFGRID = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<project source="4.1.0" version="1.0">
+  <lib desc="#Wiring" name="0"/>
+  <lib desc="#Gates" name="1"/>
+  <main name="c"/>
+  <circuit name="c">
+    <comp lib="1" loc="(200,103)" name="AND Gate"><a name="inputs" val="2"/></comp>
+    <wire from="(100,100)" to="(300,100)"/>
+    <wire from="(200,100)" to="(200,200)"/>
+  </circuit>
+</project>
+"""
+
+LOOP_XML = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<project source="4.1.0" version="1.0">
+  <lib desc="#Wiring" name="0"/>
+  <lib desc="#Gates" name="1"/>
+  <main name="loopy"/>
+  <circuit name="loopy">
+    <comp lib="1" loc="(200,100)" name="AND Gate"><a name="inputs" val="2"/></comp>
+    <comp lib="1" loc="(400,100)" name="OR Gate"><a name="inputs" val="2"/></comp>
+    <wire from="(200,100)" to="(350,100)"/>
+    <wire from="(350,100)" to="(350,80)"/>
+    <wire from="(400,100)" to="(400,40)"/>
+    <wire from="(400,40)" to="(150,40)"/>
+    <wire from="(150,40)" to="(150,80)"/>
+  </circuit>
+</project>
+"""
+
+
+def test_check_grid():
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "og.circ"
+        p.write_text(OFFGRID)
+        r = run_circuitc("check-grid", str(p))
+        d = json.loads(r.stdout)
+        assert not d["ok"]
+        assert any(v["at"] == [200, 103] for v in d["violations"])
+        # a clean generated file has no violations
+        out = _build(td, ONE_GATE)
+        assert json.loads(run_circuitc("check-grid", str(out)).stdout)["ok"]
+
+
+def test_check_collision_tjunction():
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "og.circ"
+        p.write_text(OFFGRID)
+        d = json.loads(run_circuitc("check-collision", str(p)).stdout)
+        assert any(t["at"] == [200, 100] for t in d["t_junctions"])
+
+
+def test_check_loops():
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "loop.circ"
+        p.write_text(LOOP_XML)
+        d = json.loads(run_circuitc("check-loops", str(p)).stdout)
+        assert not d["ok"] and d["loops"]
+        # a clean feed-forward circuit has no loops
+        out = _build(td, MULTI_OUT)
+        assert json.loads(run_circuitc("check-loops", str(out)).stdout)["ok"]
+
+
+def test_check_pins_hierarchy():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, HIERARCHY)
+        assert json.loads(run_circuitc("check-pins", str(out)).stdout)["ok"]
+        # adding a pin to a leaf leaves instances unwired -> flagged
+        run_circuitc("add-pin", str(out), "half_add", "Q", "--direction", "in")
+        d = json.loads(run_circuitc("check-pins", str(out)).stdout)
+        assert not d["ok"]
+        assert any(u["input_pin"] == "Q" for u in d["unwired_inputs"])
+
+
+def test_delete_and_dry_run():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, ONE_GATE + "\n" + TWO_GATE)
+        d = json.loads(run_circuitc("delete", str(out), "nand2", "--dry-run").stdout)
+        assert d["deleted"] == ["nand2"]
+        names = {c["name"] for c in json.loads(run_circuitc("describe", str(out)).stdout)["circuits"]}
+        assert "nand2" in names  # dry-run didn't touch it
+        run_circuitc("delete", str(out), "nand2")
+        names = {c["name"] for c in json.loads(run_circuitc("describe", str(out)).stdout)["circuits"]}
+        assert "nand2" not in names and "inv" in names
+
+
+def test_rename_updates_refs():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, HIERARCHY)
+        d = json.loads(run_circuitc("rename", str(out), "half_add", "HA").stdout)
+        assert d["ok"] and d["instances_updated"] == 2
+        # references now valid -> still passes pin contract
+        assert json.loads(run_circuitc("check-pins", str(out)).stdout)["ok"]
+        # renaming to an existing name fails
+        assert not json.loads(run_circuitc("rename", str(out), "HA", "full_add").stdout)["ok"]
+
+
+def test_clone():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, ONE_GATE)
+        assert json.loads(run_circuitc("clone", str(out), "inv", "inv2").stdout)["ok"]
+        names = {c["name"] for c in json.loads(run_circuitc("describe", str(out)).stdout)["circuits"]}
+        assert {"inv", "inv2"} <= names
+
+
+def test_extract_pulls_dependencies():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, HIERARCHY)
+        ex = Path(td) / "ex.circ"
+        d = json.loads(run_circuitc("extract", str(out), "full_add", "-o", str(ex)).stdout)
+        assert d["ok"] and "half_add" in d["extracted"]  # dep pulled in
+        names = {c["name"] for c in json.loads(run_circuitc("describe", str(ex)).stdout)["circuits"]}
+        assert names == {"full_add", "half_add"}
+
+
+def test_add_remove_pin():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, ONE_GATE)
+        assert json.loads(run_circuitc("add-pin", str(out), "inv", "B", "--direction", "in").stdout)["ok"]
+        ins = json.loads(run_circuitc("describe", str(out)).stdout)["circuits"][0]["inputs"]
+        assert "B" in ins
+        assert json.loads(run_circuitc("remove-pin", str(out), "inv", "B").stdout)["ok"]
+        ins = json.loads(run_circuitc("describe", str(out)).stdout)["circuits"][0]["inputs"]
+        assert "B" not in ins
+
+
+def test_replace_ref():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, HIERARCHY)
+        run_circuitc("clone", str(out), "half_add", "half_add2")
+        d = json.loads(run_circuitc("replace-ref", str(out), "half_add", "half_add2").stdout)
+        assert d["ok"] and d["instances_updated"] == 2
+
+
+def test_fix_refs_dangling():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, HIERARCHY)
+        # delete the leaf out from under its instances -> dangling references
+        run_circuitc("delete", str(out), "half_add")
+        d = json.loads(run_circuitc("fix-refs", str(out)).stdout)
+        assert not d["ok"] and any(x["references"] == "half_add" for x in d["dangling"])
+        # --auto removes the orphans
+        d2 = json.loads(run_circuitc("fix-refs", str(out), "--auto").stdout)
+        assert d2["ok"] and d2["removed"] >= 2
+
+
+def test_flatten_structural():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, HIERARCHY)
+        flat = Path(td) / "flat.circ"
+        d = json.loads(run_circuitc("flatten", str(out), "full_add", "--all",
+                                    "-o", str(flat)).stdout)
+        assert d["ok"]
+        # inlined instances are gone; no dangling pin contract issues
+        cp = json.loads(run_circuitc("check-pins", str(flat)).stdout)
+        assert cp["ok"]
+        coll = json.loads(run_circuitc("check-collision", str(flat)).stdout)
+        assert not coll["shorts"]
+
+
+def test_diff():
+    with tempfile.TemporaryDirectory() as td:
+        a = _build(td, ONE_GATE, "a.circ")
+        b = _build(td, ONE_GATE + "\n" + TWO_GATE, "b.circ")
+        d = json.loads(run_circuitc("diff", str(a), str(b)).stdout)
+        assert not d["ok"]
+        assert "nand2" in d["circuits_added"]
+        # identical files diff clean
+        assert json.loads(run_circuitc("diff", str(a), str(a)).stdout)["ok"]
+
+
+def test_diff_detects_rename():
+    with tempfile.TemporaryDirectory() as td:
+        a = _build(td, ONE_GATE, "a.circ")
+        b = _build(td, ONE_GATE, "b.circ")
+        run_circuitc("rename", str(b), "inv", "inverter")
+        d = json.loads(run_circuitc("diff", str(a), str(b)).stdout)
+        assert d["circuits_renamed"] == [["inv", "inverter"]]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Layout bounds
 # ═════════════════════════════════════════════════════════════════════════════
 
