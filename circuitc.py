@@ -2068,7 +2068,7 @@ def check_loops(path: str) -> dict:
                 comps_in = sorted({c for e, cs in comp_of_edge.items()
                                    if e[0] in scc and e[1] in scc for c in cs})
                 kinds = {c.split("@")[0].split(":")[0] for c in comps_in}
-                latch = len(comps_in) >= 2 and kinds <= {"NAND"} or kinds <= {"NOR"}
+                latch = len(comps_in) >= 2 and (kinds <= {"NAND"} or kinds <= {"NOR"})
                 loops.append({
                     "circuit": cname,
                     "nets": sorted(nm["name"](n) for n in scc),
@@ -2204,9 +2204,9 @@ def cmd_delete(args) -> int:
             if remaining:
                 main.set("name", remaining[0].get("name"))
         _rewrite(tree, args.circ)
-    report["ok"] = True
+    report["ok"] = not still_referenced
     print(json.dumps(report, indent=2))
-    return 0
+    return 0 if report["ok"] else 1
 
 
 def cmd_rename(args) -> int:
