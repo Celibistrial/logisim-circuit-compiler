@@ -602,6 +602,52 @@ LOOP_XML = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 </project>
 """
 
+NEAR_MISS_XML = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<project source="4.1.0" version="1.0">
+  <lib desc="#Wiring" name="0"/>
+  <lib desc="#Gates" name="1"/>
+  <main name="c"/>
+  <circuit name="c">
+    <comp lib="1" loc="(200,100)" name="AND Gate">
+      <a name="inputs" val="2"/>
+    </comp>
+    <wire from="(150,70)" to="(300,70)"/>
+  </circuit>
+</project>
+"""
+
+CROSSING_XML = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<project source="4.1.0" version="1.0">
+  <lib desc="#Wiring" name="0"/>
+  <main name="c"/>
+  <circuit name="c">
+    <comp lib="0" loc="(100,100)" name="Pin"><a name="label" val="A"/></comp>
+    <comp lib="0" loc="(300,100)" name="Pin"><a name="label" val="Y"/><a name="type" val="output"/></comp>
+    <comp lib="0" loc="(200,50)" name="Constant"><a name="value" val="0x1"/></comp>
+    <wire from="(100,100)" to="(300,100)"/>
+    <wire from="(200,50)" to="(200,150)"/>
+  </circuit>
+</project>
+"""
+
+DEEP_HIER = """circuit leaf:
+  inputs A
+  outputs Y
+  Y = ~A
+
+circuit mid:
+  inputs A
+  outputs Y
+  use leaf l1(A=A) -> (Y=_t)
+  Y = _t
+
+circuit top:
+  inputs A
+  outputs Y
+  use mid m1(A=A) -> (Y=_t)
+  Y = _t
+"""
+
 
 def test_check_grid():
     with tempfile.TemporaryDirectory() as td:
@@ -616,12 +662,38 @@ def test_check_grid():
         assert json.loads(run_circuitc("check-grid", str(out)).stdout)["ok"]
 
 
+def test_check_proximity():
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "near.circ"
+        p.write_text(NEAR_MISS_XML)
+        d = json.loads(run_circuitc("check-proximity", str(p)).stdout)
+        assert not d["ok"] and d["near_misses"]
+        # AND input port at (150,80), wire at y=70 — 10 px gap
+        assert any(m["distance_px"] <= 10 for m in d["near_misses"])
+        # a clean generated file has no near misses
+        out = _build(td, ONE_GATE)
+        assert json.loads(run_circuitc("check-proximity", str(out)).stdout)["ok"]
+
+
 def test_check_collision_tjunction():
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "og.circ"
         p.write_text(OFFGRID)
         d = json.loads(run_circuitc("check-collision", str(p)).stdout)
         assert any(t["at"] == [200, 100] for t in d["t_junctions"])
+
+
+def test_check_collision_crossing_short():
+    with tempfile.TemporaryDirectory() as td:
+        # mid-to-mid crossing: wires pass through same point but don't connect
+        p = Path(td) / "cross.circ"
+        p.write_text(CROSSING_XML)
+        d = json.loads(run_circuitc("check-collision", str(p)).stdout)
+        assert d["crossings"], "expected a mid-to-mid crossing"
+        # clean generated circuits have no crossings
+        out = _build(td, ONE_GATE)
+        cd = json.loads(run_circuitc("check-collision", str(out)).stdout)
+        assert not cd["crossings"] and not cd["shorts"]
 
 
 def test_check_loops():
@@ -656,6 +728,22 @@ def test_delete_and_dry_run():
         run_circuitc("delete", str(out), "nand2")
         names = {c["name"] for c in json.loads(run_circuitc("describe", str(out)).stdout)["circuits"]}
         assert "nand2" not in names and "inv" in names
+
+
+def test_delete_referenced_and_main():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, HIERARCHY)
+        # deleting a circuit with dangling refs should fail ok
+        r = run_circuitc("delete", str(out), "half_add", "--dry-run")
+        d = json.loads(r.stdout)
+        assert d["would_dangle"] and d["deleted"] == ["half_add"]
+        assert not d["ok"]  # exit 1 due to dangling ref
+
+        # deleting the main circuit reassigns main
+        out2 = _build(td, ONE_GATE + "\n" + TWO_GATE)
+        run_circuitc("delete", str(out2), "inv")
+        desc = json.loads(run_circuitc("describe", str(out2)).stdout)
+        assert desc["main"] == "nand2"
 
 
 def test_rename_updates_refs():
@@ -732,6 +820,21 @@ def test_flatten_structural():
         assert not coll["shorts"]
 
 
+def test_flatten_label_and_depth():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, DEEP_HIER)
+        # flatten just one specific instance by label
+        d = json.loads(run_circuitc("flatten", str(out), "top", "m1",
+                                    "-o", str(Path(td) / "f1.circ")).stdout)
+        assert d["ok"]
+        # flatten with depth 2 should inline through both levels
+        d2 = json.loads(run_circuitc("flatten", str(out), "top", "--all",
+                                     "--depth", "2",
+                                     "-o", str(Path(td) / "f2.circ")).stdout)
+        assert d2["ok"]
+        assert len(d2.get("flattened", [])) >= 2  # flattened both levels
+
+
 def test_diff():
     with tempfile.TemporaryDirectory() as td:
         a = _build(td, ONE_GATE, "a.circ")
@@ -755,6 +858,17 @@ def test_diff_detects_rename():
 # ═════════════════════════════════════════════════════════════════════════════
 # Layout bounds
 # ═════════════════════════════════════════════════════════════════════════════
+def test_diff_component_changes():
+    with tempfile.TemporaryDirectory() as td:
+        a = _build(td, ONE_GATE, "a.circ")
+        b = _build(td, ONE_GATE, "b.circ")
+        run_circuitc("add-pin", str(b), "inv", "B", "--direction", "in")
+        d = json.loads(run_circuitc("diff", str(a), str(b)).stdout)
+        assert not d["ok"]
+        r = run_circuitc("diff", str(a), str(b), "--text")
+        assert r.returncode == 0 and len(r.stdout) > 0
+
+
 
 def test_layout_no_runaway_coordinates():
     """Basic circuits should produce coordinates within reasonable bounds."""
