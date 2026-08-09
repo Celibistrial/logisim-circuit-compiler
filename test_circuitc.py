@@ -657,6 +657,13 @@ def test_check_grid():
         d = json.loads(r.stdout)
         assert not d["ok"]
         assert any(v["at"] == [200, 103] for v in d["violations"])
+        # --fix snaps to grid
+        r2 = run_circuitc("check-grid", str(p), "--fix")
+        d2 = json.loads(r2.stdout)
+        assert d2["ok"] and d2["fixed"] >= 1
+        # re-check after fix should be clean
+        d3 = json.loads(run_circuitc("check-grid", str(p)).stdout)
+        assert d3["ok"]
         # a clean generated file has no violations
         out = _build(td, ONE_GATE)
         assert json.loads(run_circuitc("check-grid", str(out)).stdout)["ok"]

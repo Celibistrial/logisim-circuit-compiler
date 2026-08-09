@@ -2243,6 +2243,35 @@ def _checker_details(name: str, result: dict) -> str:
     return ""
 
 
+def cmd_check_grid(args) -> int:
+    result = check_grid(args.circ)
+    if args.fix and result["violations"]:
+        tree, root = _load(args.circ)
+        fixed = 0
+        for v in result["violations"]:
+            for celem in root.findall("circuit"):
+                if celem.get("name") != v["circuit"]:
+                    continue
+                for comp in celem.findall("comp"):
+                    loc = _parse_loc(comp.get("loc"))
+                    if list(loc) == v["at"]:
+                        new = (_nearest_grid(loc[0]), _nearest_grid(loc[1]))
+                        comp.set("loc", f"({new[0]},{new[1]})")
+                        fixed += 1
+                for wire in celem.findall("wire"):
+                    for attr in ("from", "to"):
+                        pt = _parse_loc(wire.get(attr))
+                        if list(pt) == v["at"]:
+                            new = (_nearest_grid(pt[0]), _nearest_grid(pt[1]))
+                            wire.set(attr, f"({new[0]},{new[1]})")
+                            fixed += 1
+        _rewrite(tree, args.circ)
+        result["fixed"] = fixed
+        result["ok"] = True
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
 # ---------------------------------------------------------------------------
 # Circuit-level edits: delete / rename / clone / extract (#9, #10, #11)
 # ---------------------------------------------------------------------------
@@ -2866,7 +2895,8 @@ def main(argv=None) -> int:
 
     cg = sub.add_parser("check-grid", help="report off-10px-grid coords (#1)")
     cg.add_argument("circ")
-    cg.set_defaults(fn=_checker(check_grid))
+    cg.add_argument("--fix", action="store_true", help="snap off-grid components/wires to nearest grid point")
+    cg.set_defaults(fn=cmd_check_grid)
 
     cp = sub.add_parser("check-proximity", help="ports that almost touch a wire (#2)")
     cp.add_argument("circ")
