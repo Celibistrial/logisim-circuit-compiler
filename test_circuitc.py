@@ -707,6 +707,34 @@ def test_check_loops():
         assert json.loads(run_circuitc("check-loops", str(out)).stdout)["ok"]
 
 
+def test_check_all():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, ONE_GATE)
+        d = json.loads(run_circuitc("check-all", str(out)).stdout)
+        assert d["ok"]
+        assert set(d["checks"]) == {"grid", "proximity", "collision", "loops", "pins"}
+        assert all(v["ok"] for v in d["checks"].values())
+        # --checks subset
+        d2 = json.loads(run_circuitc("check-all", str(out),
+                                     "--checks", "grid,collision").stdout)
+        assert set(d2["checks"]) == {"grid", "collision"}
+        # --text mode
+        r = run_circuitc("check-all", str(out), "--text")
+        assert "PASS" in r.stdout and "RESULT" in r.stdout
+        # --ci mode exits non-zero when a check fails
+        import xml.etree.ElementTree as ET
+        bad = Path(td) / "bad.circ"
+        tree = ET.parse(str(out))
+        root = tree.getroot()
+        for ce in root.findall("circuit"):
+            ce.append(ET.fromstring(
+                '<comp lib="1" loc="(99,103)" name="AND Gate">'
+                '<a name="inputs" val="2"/></comp>'))
+        tree.write(str(bad))
+        r2 = run_circuitc("check-all", str(bad), "--ci")
+        assert r2.returncode != 0
+
+
 def test_check_pins_hierarchy():
     with tempfile.TemporaryDirectory() as td:
         out = _build(td, HIERARCHY)

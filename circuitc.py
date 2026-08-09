@@ -2120,6 +2120,34 @@ def _sccs(edges: dict) -> list:
     return out
 
 
+_CHECKERS = {
+    "grid": check_grid,
+    "proximity": check_proximity,
+    "collision": check_collision,
+    "loops": check_loops,
+    "pins": check_pins,
+}
+
+
+def check_all(path: str, checks=None) -> dict:
+    """Run all (or a named subset of) analysis checkers and return a
+    consolidated report.  The top-level ``ok`` is true only when every
+    selected checker passes.
+    """
+    requested = checks or list(_CHECKERS)
+    unknown = [c for c in requested if c not in _CHECKERS]
+    if unknown:
+        return {"ok": False, "error": f"unknown checkers: {sorted(unknown)}"}
+    results: dict = {}
+    for name in requested:
+        try:
+            results[name] = _CHECKERS[name](path)
+        except Exception as exc:
+            results[name] = {"ok": False, "error": str(exc)}
+    all_ok = all(r.get("ok", False) for r in results.values())
+    return {"ok": all_ok, "checks": results}
+
+
 # ---------------------------------------------------------------------------
 # Golden-model / exhaustive testing of any .circ (#3, #4)
 # ---------------------------------------------------------------------------
@@ -2167,6 +2195,52 @@ def cmd_test(args) -> int:
     report["ok"] = ok
     print(json.dumps(report, indent=2))
     return 0 if ok else 1
+
+
+def cmd_check_all(args) -> int:
+    checks = [c.strip() for c in args.checks.split(",")] if args.checks else None
+    result = check_all(args.circ, checks)
+    if "error" in result:
+        print(json.dumps(result, indent=2))
+        return 1
+    if args.text:
+        _print_check_all_text(result)
+    else:
+        print(json.dumps(result, indent=2))
+    if args.ci:
+        return 0 if result["ok"] else 1
+    return 0 if result.get("checks") else 1
+
+
+def _print_check_all_text(report: dict):
+    results = report["checks"]
+    for name, r in results.items():
+        ok = r.get("ok", False)
+        tag = "PASS" if ok else "FAIL"
+        details = _checker_details(name, r)
+        print(f"  {tag:6s} {name:12s} {details}")
+    passed = sum(1 for r in results.values() if r.get("ok"))
+    total = len(results)
+    print(f"\nRESULT: {passed}/{total} checks passed")
+
+
+def _checker_details(name: str, result: dict) -> str:
+    if result.get("error"):
+        return result["error"]
+    if name == "grid":
+        return f"{len(result.get('violations', []))} off-grid"
+    if name == "proximity":
+        return f"{len(result.get('near_misses', []))} near-misses"
+    if name == "collision":
+        n = len(result.get("shorts", []))
+        return f"{n} shorts, {len(result.get('crossings', []))} crossings"
+    if name == "loops":
+        return f"{len(result.get('loops', []))} loops"
+    if name == "pins":
+        u = len(result.get("unwired_inputs", []))
+        d = len(result.get("dangling_instances", []))
+        return f"{u} unwired, {d} dangling"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -2812,6 +2886,13 @@ def main(argv=None) -> int:
     cl = sub.add_parser("check-loops", help="combinational feedback loop detector (#6)")
     cl.add_argument("circ")
     cl.set_defaults(fn=_checker(check_loops))
+
+    ca = sub.add_parser("check-all", help="run all checkers in one pass")
+    ca.add_argument("circ")
+    ca.add_argument("--checks", help="comma-separated subset (grid,proximity,collision,loops,pins)")
+    ca.add_argument("--text", action="store_true", help="human-readable summary")
+    ca.add_argument("--ci", action="store_true", help="exit non-zero unless every checker passes")
+    ca.set_defaults(fn=cmd_check_all)
 
     # ---- golden-model / exhaustive test of any .circ (#3, #4) ----
     t = sub.add_parser("test", help="truth-table validate any .circ (#3,#4)")
