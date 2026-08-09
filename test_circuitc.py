@@ -832,13 +832,25 @@ def test_replace_ref():
 def test_fix_refs_dangling():
     with tempfile.TemporaryDirectory() as td:
         out = _build(td, HIERARCHY)
-        # delete the leaf out from under its instances -> dangling references
         run_circuitc("delete", str(out), "half_add")
         d = json.loads(run_circuitc("fix-refs", str(out)).stdout)
         assert not d["ok"] and any(x["references"] == "half_add" for x in d["dangling"])
+        # suggestions field uses difflib
+        assert any(x.get("suggestions") for x in d["dangling"])
         # --auto removes the orphans
         d2 = json.loads(run_circuitc("fix-refs", str(out), "--auto").stdout)
         assert d2["ok"] and d2["removed"] >= 2
+
+
+def test_fix_refs_replace_with():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, HIERARCHY)
+        run_circuitc("clone", str(out), "half_add", "half_add2")
+        run_circuitc("delete", str(out), "half_add")
+        # --auto --replace-with should swap in the clone
+        d = json.loads(run_circuitc("fix-refs", str(out), "--auto",
+                                    "--replace-with", "half_add2").stdout)
+        assert d["ok"] and d["replaced"] >= 2
 
 
 def test_flatten_structural():
