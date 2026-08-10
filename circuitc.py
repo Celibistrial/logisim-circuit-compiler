@@ -2696,7 +2696,19 @@ def cmd_set_property(args) -> int:
         return 0
 
     _rewrite(tree, args.circ)
-    print(json.dumps({"ok": True, "changed": len(changed), "properties": changed}, indent=2))
+    result = {"ok": True, "changed": len(changed), "properties": changed}
+    for c in changed:
+        if c["type"] == "Pin" and c["property"] == "width":
+            try:
+                if int(c["value"]) > 1:
+                    result["hint"] = (
+                        f"Pin {c['label']!r} is now {c['value']}-bit wide. "
+                        "Use a Splitter in Logisim to fan out/in individual bit wires. "
+                        "Remove the other per-bit pins with `remove-pin`."
+                    )
+            except ValueError:
+                pass
+    print(json.dumps(result, indent=2))
     return 0
 
 

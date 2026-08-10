@@ -26,6 +26,37 @@ let the tool compile and verify. If a `.circ` needs to change, change the
 Exit code mirrors `ok`. All errors are JSON on stdout — you never need to
 parse tracebacks.
 
+## Multi-bit pins with splitters
+
+The `.logic` format uses 1-bit signals only — a 64-bit adder compiles with
+individual `A0..A63` input pins. **Before delivering a `.circ`, convert
+groups of related pins into a single multi-bit pin + Splitter:**
+
+```bash
+# 1. Set one pin to the full bus width (others stay as-is)
+python3 circuitc.py set-property design.circ adder64 --label A0 --set width=64
+# 2. Remove the remaining individual pins
+for i in $(seq 1 63); do
+  python3 circuitc.py remove-pin design.circ adder64 A$i
+done
+# 3. Do the same for B inputs and S outputs (width=64, facing=west for outputs)
+python3 circuitc.py set-property design.circ adder64 --label B0 --set width=64
+python3 circuitc.py set-property design.circ adder64 --label S0 --set width=64
+# 4. In Logisim, place a Splitter on each wide pin to fan out/in the bit
+#    wires to internal subcircuit ports. The splitter maps bit lanes
+#    mechanically — use the "Fan Out" attribute to control direction.
+
+# If re-running behavioral checks with a jar, rebuild the file first.
+```
+
+- **Always prefer a single `width=N` pin over N individual 1-bit pins.**
+  The `.logic` requires individual pins at compile time, but the delivered
+  `.circ` should be cleaned up for clarity.
+- Use `python3 circuitc.py set-property` to change any pin's width, facing,
+  or label after building.
+- Pin widths don't affect structural checks — geometry stays valid.
+- Use `describe` to see all pin labels in a circuit before editing.
+
 ## .logic format
 
 ```
@@ -103,10 +134,11 @@ in the `--merge` target. Wire every input pin (constants 0/1 allowed).
 ## Other commands
 
 ```bash
-python3 circuitc.py describe file.circ   # JSON netlist of any .circ (pins, comps, nets)
-python3 circuitc.py check file.circ      # structural + load check of an existing .circ
+python3 circuitc.py describe file.circ       # JSON netlist of any .circ (pins, comps, nets)
+python3 circuitc.py check file.circ          # structural + load check of an existing .circ
 python3 circuitc.py verify file.circ --spec spec.logic   # test ANY .circ against golden models
 python3 circuitc.py build new.logic -o existing.circ --merge [--lib old.logic]
+python3 circuitc.py set-property file.circ circuit --label X --set width=64   # edit pin props
 ```
 
 - `verify`: spec block names must match circuit names in the file, and pin
