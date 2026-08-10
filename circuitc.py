@@ -2635,6 +2635,12 @@ def cmd_flatten(args) -> int:
 
 def cmd_set_property(args) -> int:
     """Edit properties (XML attributes) on components within a circuit."""
+    if args.all and args.label is None and args.type is None:
+        print(json.dumps({"ok": False,
+                          "error": "--all requires --label or --type to avoid "
+                                   "matching every component in the circuit"}))
+        return 1
+
     tree, root = _load(args.circ)
     celem = _circ(root, args.circuit)
     if celem is None:
@@ -2659,7 +2665,10 @@ def cmd_set_property(args) -> int:
     if len(matches) > 1 and not args.all:
         entries = []
         for c, l, t, _ in matches:
-            loc = _parse_loc(c.get("loc"))
+            loc_str = c.get("loc")
+            if loc_str is None:
+                continue
+            loc = _parse_loc(loc_str)
             entries.append({"label": l, "type": t, "at": list(loc)})
         print(json.dumps({
             "ok": False,
@@ -2668,14 +2677,19 @@ def cmd_set_property(args) -> int:
         }, indent=2))
         return 1
 
+    warnings = []
     changed = []
     for comp, label, comp_type, attrs in matches:
+        loc_str = comp.get("loc")
+        at = list(_parse_loc(loc_str)) if loc_str else None
         for kv in args.set:
             if "=" not in kv:
+                warnings.append(f"ignoring malformed --set {kv!r} (missing '=')")
                 continue
             key, val = kv.split("=", 1)
             key, val = key.strip(), val.strip()
             if not key or not val:
+                warnings.append(f"ignoring malformed --set {kv!r} (empty key or value)")
                 continue
             found = False
             for a in comp.findall("a"):
@@ -2689,25 +2703,34 @@ def cmd_set_property(args) -> int:
                 a.set("val", val)
             changed.append({"label": label, "type": comp_type,
                             "property": key, "value": val,
-                            "at": list(_parse_loc(comp.get("loc")))})
+                            "at": at})
 
     if not changed:
-        print(json.dumps({"ok": True, "changed": 0, "note": "no properties to set"}))
+        result = {"ok": True, "changed": 0, "note": "no properties to set"}
+        if warnings:
+            result["warnings"] = warnings
+        print(json.dumps(result, indent=2))
         return 0
 
     _rewrite(tree, args.circ)
     result = {"ok": True, "changed": len(changed), "properties": changed}
+    hints = []
     for c in changed:
         if c["type"] == "Pin" and c["property"] == "width":
             try:
                 if int(c["value"]) > 1:
-                    result["hint"] = (
+                    hints.append(
                         f"Pin {c['label']!r} is now {c['value']}-bit wide. "
                         "Use a Splitter in Logisim to fan out/in individual bit wires. "
-                        "Remove the other per-bit pins with `remove-pin`."
+                        "Remove other per-bit pins: "
+                        f"`circuitc.py remove-pin <file> <circuit> <label>`"
                     )
             except ValueError:
                 pass
+    if hints:
+        result["hints"] = hints
+    if warnings:
+        result["warnings"] = warnings
     print(json.dumps(result, indent=2))
     return 0
 
