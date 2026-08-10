@@ -2630,7 +2630,78 @@ def cmd_flatten(args) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Circuit diff (#15)
+# Component property editor (#15)
+# ---------------------------------------------------------------------------
+
+def cmd_set_property(args) -> int:
+    """Edit properties (XML attributes) on components within a circuit."""
+    tree, root = _load(args.circ)
+    celem = _circ(root, args.circuit)
+    if celem is None:
+        print(json.dumps({"ok": False, "error": f"circuit {args.circuit!r} not found"}))
+        return 1
+
+    matches = []
+    for comp in celem.findall("comp"):
+        attrs = _comp_attrs(comp)
+        label = attrs.get("label", "")
+        comp_type = comp.get("name")
+        if args.label is not None and label != args.label:
+            continue
+        if args.type is not None and comp_type != args.type:
+            continue
+        matches.append((comp, label, comp_type, attrs))
+
+    if not matches:
+        print(json.dumps({"ok": False, "error": "no matching components found"}))
+        return 1
+
+    if len(matches) > 1 and not args.all:
+        entries = []
+        for c, l, t, _ in matches:
+            loc = _parse_loc(c.get("loc"))
+            entries.append({"label": l, "type": t, "at": list(loc)})
+        print(json.dumps({
+            "ok": False,
+            "error": f"{len(matches)} components match; be more specific with --label/--type or use --all",
+            "matches": entries,
+        }, indent=2))
+        return 1
+
+    changed = []
+    for comp, label, comp_type, attrs in matches:
+        for kv in args.set:
+            if "=" not in kv:
+                continue
+            key, val = kv.split("=", 1)
+            key, val = key.strip(), val.strip()
+            if not key or not val:
+                continue
+            found = False
+            for a in comp.findall("a"):
+                if a.get("name") == key:
+                    a.set("val", val)
+                    found = True
+                    break
+            if not found:
+                a = ET.SubElement(comp, "a")
+                a.set("name", key)
+                a.set("val", val)
+            changed.append({"label": label, "type": comp_type,
+                            "property": key, "value": val,
+                            "at": list(_parse_loc(comp.get("loc")))})
+
+    if not changed:
+        print(json.dumps({"ok": True, "changed": 0, "note": "no properties to set"}))
+        return 0
+
+    _rewrite(tree, args.circ)
+    print(json.dumps({"ok": True, "changed": len(changed), "properties": changed}, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Circuit diff (#16)
 # ---------------------------------------------------------------------------
 
 def _circ_signature(celem, root) -> dict:
@@ -2993,7 +3064,17 @@ def main(argv=None) -> int:
     fl.add_argument("-o", "--output")
     fl.set_defaults(fn=cmd_flatten)
 
-    df = sub.add_parser("diff", help="structural diff of two .circ files (#15)")
+    sp = sub.add_parser("set-property", help="edit component properties (facing, width, label, etc.)")
+    sp.add_argument("circ")
+    sp.add_argument("circuit")
+    sp.add_argument("--label", help="match components with this label")
+    sp.add_argument("--type", help="match component type (e.g. Pin, AND Gate, Constant)")
+    sp.add_argument("--set", action="append", required=True,
+                    help="property=value to assign (repeatable, e.g. --set facing=north --set width=8)")
+    sp.add_argument("--all", action="store_true", help="apply to all matching components")
+    sp.set_defaults(fn=cmd_set_property)
+
+    df = sub.add_parser("diff", help="structural diff of two .circ files (#16)")
     df.add_argument("file_a")
     df.add_argument("file_b")
     df.add_argument("--circuit", help="diff only this circuit")
