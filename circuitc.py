@@ -799,7 +799,10 @@ def _route_gates(net: Netlist, registry: dict | None = None,
                 if node[0] == "inst":
                     inst_fed.add(s)
     always_lane = set(net.inputs) | set(net.const_nets) | {cn(o) for o in pin_outputs}
-    always_lane |= {cn(s) for s in descend} | inst_fed
+    always_lane |= {cn(s) for s in descend}
+    # Instance-fed signals only force lane promotion when they have
+    # multiple consumers or span columns — single-consumer signals
+    # should attempt straight-wire routing like gate signals do.
 
     # row planning per column: aligned rows for straight-wire candidates.
     # rel_out_y[sig] = producer output y relative to gate_top.
@@ -820,6 +823,18 @@ def _route_gates(net: Netlist, registry: dict | None = None,
             ay = None
             if kind == "inst":
                 _, _, span = _inst_ports(obj, registry)
+                # try row-aligning with a straight-wire input pin
+                iports_in, _, _ = _inst_ports(obj, registry)
+                for dx, dy, sig in iports_in:
+                    s = cn(sig)
+                    # an instance pin at dy wants the producer at ay+dy
+                    if (uses.get(s) == 1 and s not in always_lane
+                            and not span_far.get(s) and s in rel_out_y
+                            and depth.get(s, 0) == ci - 1
+                            and fits(rel_out_y[s] - dy, span)):
+                        ay = rel_out_y[s] - dy
+                        direct.add(s)
+                        break
             else:
                 # try row-aligning with a straight-wire input (center port only)
                 ins, _ = gate_ports(obj.kind, len(obj.inputs))
