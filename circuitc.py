@@ -662,6 +662,13 @@ def _cell_anchor(index: int) -> tuple[int, int]:
     return (ORIGIN[0] + col * CELL_W + 130, ORIGIN[1] + row * CELL_H + 40)
 
 
+def _jitter(key, amplitude=GRID):
+    """Deterministic pseudo-random offset in multiples of *amplitude*.
+    Returns -amplitude, 0, or +amplitude based on hash(key)."""
+    h = abs(hash(str(key))) % 65537
+    return ((h % 3) - 1) * amplitude
+
+
 def _xml_comp(lib: str | None, name: str, loc: tuple[int, int], attrs: dict[str, str]) -> str:
     a = "".join(
         f'\n      <a name="{escape(k)}" val="{escape(v)}"/>' for k, v in attrs.items()
@@ -807,7 +814,7 @@ def _route_gates(net: Netlist, registry: dict | None = None,
             return all(hi < ay - 25 or lo > ay + span + 25 for lo, hi in occupied)
 
         cursor = 20
-        for node in col:
+        for pi, node in enumerate(col):
             kind, obj = node
             span = 0
             ay = None
@@ -828,7 +835,7 @@ def _route_gates(net: Netlist, registry: dict | None = None,
                 while not fits(cursor, span):
                     cursor += 10
                 ay = cursor
-                cursor += span + 70
+                cursor += span + 70 + _jitter(f"y_{ci}_{pi}")
             occupied.append((ay - 25, ay + span + 25))
             placed.append((node, ay, span))
             if kind == "gate":
@@ -868,13 +875,13 @@ def _route_gates(net: Netlist, registry: dict | None = None,
         anchor[s] = (X_PIN, lane_y[s])
 
     x = X_PIN
-    for placed in col_rows:
+    for ci, placed in enumerate(col_rows):
         consumed: list[str] = []   # lane-promoted signals tapped in this column
         for node, _, _ in placed:
             for s in node_ins(node):
                 if s in promoted and s not in consumed:
                     consumed.append(s)
-        chan_x = x + 30
+        chan_x = x + 30 + _jitter(f"chan_{ci}")
         drop_x = {s: chan_x + 20 * i for i, s in enumerate(consumed)}
         gate_in_x = chan_x + 20 * len(consumed) + 20
 
