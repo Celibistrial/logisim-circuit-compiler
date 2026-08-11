@@ -664,7 +664,9 @@ def _cell_anchor(index: int) -> tuple[int, int]:
 
 def _jitter(key, amplitude=GRID):
     """Deterministic pseudo-random offset in multiples of *amplitude*.
-    Returns -amplitude, 0, or +amplitude based on hash(key)."""
+    Returns -amplitude, 0, or +amplitude based on hash(key).
+    A second call with the same key shifted returns a different offset,
+    allowing two degrees of variation per key."""
     h = abs(hash(str(key))) % 65537
     return ((h % 3) - 1) * amplitude
 
@@ -850,7 +852,7 @@ def _route_gates(net: Netlist, registry: dict | None = None,
                 while not fits(cursor, span):
                     cursor += 10
                 ay = cursor
-                cursor += span + 70 + _jitter(f"y_{ci}_{pi}")
+                cursor += span + 70 + _jitter(f"y_{ci}_{pi}", 2 * GRID)
             occupied.append((ay - 25, ay + span + 25))
             placed.append((node, ay, span))
             if kind == "gate":
@@ -867,8 +869,21 @@ def _route_gates(net: Netlist, registry: dict | None = None,
     for node in net.nodes:
         produced += node_outs(node)
     lane_sigs = [s for s in produced if s in promoted]
-    lane_y = {s: 40 + 20 * i for i, s in enumerate(lane_sigs)}
-    gate_top = 40 + 20 * len(lane_sigs) + 60
+    # Insert extra gaps between groups of related signals (same prefix)
+    _base = 40
+    _gap = 20
+    lane_y: dict[str, int] = {}
+    _prev_prefix = None
+    _yi = 0
+    for s in lane_sigs:
+        # extract prefix: "A0" -> "A", "_t3" -> "_t", "overflow" -> "overflow"
+        prefix = s.rstrip("0123456789")
+        if prefix != _prev_prefix and _yi > 0:
+            _yi += 1  # extra 20 px gap between groups
+        lane_y[s] = _base + _gap * _yi
+        _yi += 1
+        _prev_prefix = prefix
+    gate_top = _base + _gap * (_yi - 1) + 80  # extra 20px margin for gaps
 
     X_PIN = 60
     lane_start: dict[str, int] = {}
@@ -896,7 +911,7 @@ def _route_gates(net: Netlist, registry: dict | None = None,
             for s in node_ins(node):
                 if s in promoted and s not in consumed:
                     consumed.append(s)
-        chan_x = x + 30 + _jitter(f"chan_{ci}")
+        chan_x = x + 30 + _jitter(f"chan_{ci}", 2 * GRID)
         drop_x = {s: chan_x + 20 * i for i, s in enumerate(consumed)}
         gate_in_x = chan_x + 20 * len(consumed) + 20
 
@@ -1844,6 +1859,17 @@ def _wires_of(celem) -> list:
 
 def _comp_attrs(comp) -> dict:
     return {a.get("name"): a.get("val") for a in comp.findall("a")}
+
+
+def _set_comp_attr(comp, name: str, val: str):
+    """Set an <a name=... val=.../> attribute on a component element."""
+    for a in comp.findall("a"):
+        if a.get("name") == name:
+            a.set("val", val)
+            return
+    a = ET.SubElement(comp, "a")
+    a.set("name", name)
+    a.set("val", val)
 
 
 def _instance_comps(celem, names: set) -> list:
@@ -2880,6 +2906,76 @@ def _merge_into(out_path: str, nets: list[Netlist]) -> None:
     tree.write(out_path, encoding="UTF-8", xml_declaration=True)
 
 
+def _detect_buses(celem) -> list[tuple[str, int, list[str]]]:
+    """Find groups of numbered pins sharing a prefix in *celem*.
+    Returns list of (prefix, first_index, [pin_labels...]).
+    Example: [('A', 0, ['A0','A1','A2','A3']), ('B', 0, ['B0','B1'])]
+    """
+    import re
+    pins = []
+    for comp in celem.findall("comp"):
+        if comp.get("name") == "Pin":
+            label = _comp_attrs(comp).get("label", "")
+            pins.append(label)
+    groups: dict[str, list] = {}
+    for p in pins:
+        m = re.fullmatch(r"([A-Za-z_]+)(\d+)", p)
+        if m:
+            prefix, num = m.group(1), int(m.group(2))
+            groups.setdefault(prefix, []).append((num, p))
+    buses = []
+    for prefix, entries in sorted(groups.items()):
+        entries.sort()
+        labels = []
+        ok = True
+        for i, (num, label) in enumerate(entries):
+            if num != i:
+                ok = False
+                break
+            labels.append(label)
+        if ok and len(labels) >= 2:
+            buses.append((prefix, 0, labels))
+    return buses
+
+
+def cmd_busify(args) -> int:
+    tree, root = _load(args.circ)
+    targets = [c for c in root.findall("circuit")
+               if not args.circuit or c.get("name") == args.circuit]
+    report = {"converted": []}
+    for celem in targets:
+        cname = celem.get("name")
+        buses = _detect_buses(celem)
+        for prefix, _, labels in buses:
+            if len(labels) < args.min_width:
+                continue
+            n = len(labels)
+            for comp in celem.findall("comp"):
+                if comp.get("name") == "Pin" and _comp_attrs(comp).get("label") == labels[0]:
+                    _set_comp_attr(comp, "width", str(n))
+                    break
+            for label in labels[1:]:
+                for comp in list(celem.findall("comp")):
+                    if comp.get("name") == "Pin" and _comp_attrs(comp).get("label") == label:
+                        loc = _parse_loc(comp.get("loc"))
+                        celem.remove(comp)
+                        for wire in list(celem.findall("wire")):
+                            a, b = _parse_loc(wire.get("from")), _parse_loc(wire.get("to"))
+                            if a == loc or b == loc:
+                                celem.remove(wire)
+                        break
+            report["converted"].append({
+                "circuit": cname, "pin": labels[0], "width": n,
+                "removed": labels[1:],
+                "hint": f"Place a Splitter in Logisim on pin {labels[0]} "
+                        f"to fan out to {n} individual bit wires.",
+            })
+    _rewrite(tree, args.circ)
+    report["ok"] = True
+    print(json.dumps(report, indent=2))
+    return 0
+
+
 def cmd_build(args) -> int:
     src = Path(args.source).read_text()
     circuits = parse_logic(src)
@@ -3137,6 +3233,12 @@ def main(argv=None) -> int:
     df.add_argument("--circuit", help="diff only this circuit")
     df.add_argument("--text", action="store_true", help="human-readable output")
     df.set_defaults(fn=cmd_diff)
+
+    bu = sub.add_parser("busify", help="convert groups of numbered pins into multi-bit pins")
+    bu.add_argument("circ")
+    bu.add_argument("circuit", nargs="?", help="target circuit (default: all circuits)")
+    bu.add_argument("--min-width", type=int, default=2, help="minimum group size to convert")
+    bu.set_defaults(fn=cmd_busify)
 
     args = ap.parse_args(argv)
     try:
