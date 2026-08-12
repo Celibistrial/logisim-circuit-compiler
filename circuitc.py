@@ -66,6 +66,7 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -667,7 +668,10 @@ def _jitter(key, amplitude=GRID):
     Returns -amplitude, 0, or +amplitude based on hash(key).
     A second call with the same key shifted returns a different offset,
     allowing two degrees of variation per key."""
-    h = abs(hash(str(key))) % 65537
+    # Python's built-in hash is salted per process, which used to make two
+    # identical builds drift by a grid cell. CRC32 is stable across runs and
+    # platforms while still spreading nearby layout keys adequately.
+    h = zlib.crc32(str(key).encode("utf-8"))
     return ((h % 3) - 1) * amplitude
 
 
@@ -1436,6 +1440,62 @@ def _parse_loc(s: str) -> tuple[int, int]:
     return (int(a), int(b))
 
 
+def _splitter_ports(comp) -> list[tuple[str, tuple[int, int], int]]:
+    """Return ``(name, location, width)`` for a Logisim Splitter.
+
+    The geometry mirrors Logisim Evolution's ``SplitterParameters``.  Port 0
+    is the combined bus at the component anchor; the remaining ports are the
+    fan-out ends.  Keeping this here (rather than treating a splitter as an
+    ordinary component) lets the offline checkers catch both floating ends
+    and width mismatches without requiring a Logisim jar.
+    """
+    loc = _parse_loc(comp.get("loc"))
+    attrs = _comp_attrs(comp)
+    incoming = int(attrs.get("incoming", "2"))
+    fanout = int(attrs.get("fanout", "2"))
+    spacing = int(attrs.get("spacing", "1"))
+    facing = attrs.get("facing", "east")
+    appear = attrs.get("appear", "left")
+    justify = {"left": -1, "right": 1, "center": 0, "legacy": 0}.get(appear, -1)
+    gap = spacing * GRID
+
+    if facing in ("north", "south"):
+        m = 1 if facing == "north" else -1
+        x0 = gap * ((fanout + 1) // 2 - 1) if justify == 0 else \
+            (-GRID if m * justify < 0 else GRID + gap * (fanout - 1))
+        y0 = -m * 20
+        dx, dy = -gap, 0
+    else:
+        m = -1 if facing == "west" else 1
+        x0 = m * 20
+        y0 = -gap * (fanout // 2) if justify == 0 else \
+            (GRID if m * justify > 0 else -(GRID + gap * (fanout - 1)))
+        dx, dy = 0, gap
+
+    # XML bitN values are zero-based fan-out indices; omitted values use
+    # Logisim's default even distribution.  busify emits one bit per end.
+    ends = []
+    explicit_values = {int(k[3:]): v for k, v in attrs.items()
+                       if k.startswith("bit") and k[3:].isdigit()}
+    if explicit_values:
+        bit_ends = [0 if explicit_values.get(i) == "none"
+                    else int(explicit_values[i]) + 1 if i in explicit_values
+                    else min(i + 1, fanout)
+                    for i in range(incoming)]
+    elif fanout >= incoming:
+        bit_ends = [i + 1 for i in range(incoming)]
+    else:
+        q, r = divmod(incoming, fanout)
+        bit_ends = []
+        for end in range(1, fanout + 1):
+            bit_ends.extend([end] * (q + (1 if end <= r else 0)))
+    widths = [sum(1 for end in bit_ends if end == i) for i in range(1, fanout + 1)]
+    for i in range(fanout):
+        ends.append((f"end{i}", (loc[0] + x0 + i * dx, loc[1] + y0 + i * dy),
+                     widths[i]))
+    return [("combined", loc, incoming)] + ends
+
+
 class _UF:
     def __init__(self):
         self.p = {}
@@ -1490,6 +1550,9 @@ def _ports_of(celem, root=None) -> tuple[list, list]:
             ports.append((f"{name}@{loc}", "driver", loc))
         elif name == "Pull Resistor":
             ports.append((f"pull@{loc}", "soft-driver", loc))
+        elif name == "Splitter":
+            for port, ploc, _ in _splitter_ports(comp):
+                ports.append((f"splitter@{loc}.{port}", "passive", ploc))
         elif name in ("Transistor", "Transmission Gate"):
             # Transistor.updatePorts / TransmissionGate.updatePorts, all
             # orientations (validated against GUI-drawn wires in real files)
@@ -2078,6 +2141,80 @@ def check_pins(path: str, root=None) -> dict:
             "dangling_references": dangling}
 
 
+def _pin_defs(celem) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """Like :func:`_pin_orders`, but retain each pin's declared width."""
+    ins, outs = [], []
+    for comp in celem.findall("comp"):
+        if comp.get("name") != "Pin":
+            continue
+        x, y = _parse_loc(comp.get("loc"))
+        attrs = _comp_attrs(comp)
+        item = (y, x, attrs.get("label", "?"), int(attrs.get("width", "1")))
+        is_out = attrs.get("type") == "output" or attrs.get("output") == "true"
+        (outs if is_out else ins).append(item)
+    return ([(label, width) for _, _, label, width in sorted(ins)],
+            [(label, width) for _, _, label, width in sorted(outs)])
+
+
+def _width_ports_of(celem, root) -> list[tuple[str, tuple[int, int], int]]:
+    """Return every width-constraining component port in one circuit."""
+    registry = {c.get("name"): _pin_defs(c) for c in root.findall("circuit")}
+    ports = []
+    for comp in celem.findall("comp"):
+        name = comp.get("name")
+        loc = _parse_loc(comp.get("loc"))
+        attrs = _comp_attrs(comp)
+        width = int(attrs.get("width", "1"))
+        if name in ("Pin", "Constant", "Power", "Ground", "Pull Resistor", "Tunnel"):
+            ports.append((f"{name}:{attrs.get('label', '')}@{loc}", loc, width))
+        elif name == "Splitter":
+            for port, ploc, pwidth in _splitter_ports(comp):
+                ports.append((f"Splitter@{loc}.{port}", ploc, pwidth))
+        elif name in _GATE_KINDS:
+            kind = _GATE_KINDS[name]
+            n = 1 if kind == "NOT" else int(attrs.get("inputs", "5"))
+            gate_ins, gate_out = gate_ports(kind, n)
+            for i, (dx, dy) in enumerate(gate_ins):
+                ports.append((f"{name}@{loc}.in{i}", (loc[0] + dx, loc[1] + dy), width))
+            ports.append((f"{name}@{loc}.out", (loc[0] + gate_out[0], loc[1] + gate_out[1]), width))
+        elif comp.get("lib") is None and name in registry:
+            inputs, outputs = registry[name]
+            label = attrs.get("label", "")
+            for i, (pin, pwidth) in enumerate(inputs):
+                ports.append((f"{name}:{label}.{pin}",
+                              (loc[0] - INST_W, loc[1] + 20 * i), pwidth))
+            for i, (pin, pwidth) in enumerate(outputs):
+                ports.append((f"{name}:{label}.{pin}",
+                              (loc[0], loc[1] + 20 * i), pwidth))
+    return ports
+
+
+def check_widths(path: str) -> dict:
+    """Find nets whose connected component ports disagree on bit width.
+
+    This specifically closes the old ``busify`` blind spot: widening a Pin
+    while leaving it attached to a scalar wire now fails immediately.
+    """
+    _, root = _load(path)
+    mismatches = []
+    for celem in root.findall("circuit"):
+        nm = _net_map(celem, root)
+        by_net: dict = {}
+        for descr, loc, width in _width_ports_of(celem, root):
+            netid = nm["netid"](loc)
+            by_net.setdefault(netid, []).append((descr, loc, width))
+        for entries in by_net.values():
+            widths = sorted({width for _, _, width in entries if width > 0})
+            if len(widths) > 1:
+                mismatches.append({
+                    "circuit": celem.get("name"),
+                    "widths": widths,
+                    "ports": [{"port": d, "at": list(loc), "width": width}
+                              for d, loc, width in entries],
+                })
+    return {"ok": not mismatches, "mismatches": mismatches}
+
+
 # ---------------------------------------------------------------------------
 # Combinational feedback loop detector (#6)
 # ---------------------------------------------------------------------------
@@ -2172,6 +2309,7 @@ _CHECKERS = {
     "grid": check_grid,
     "proximity": check_proximity,
     "collision": check_collision,
+    "widths": check_widths,
     "loops": check_loops,
     "pins": check_pins,
 }
@@ -2194,6 +2332,18 @@ def check_all(path: str, checks=None) -> dict:
             results[name] = {"ok": False, "error": str(exc)}
     all_ok = all(r.get("ok", False) for r in results.values())
     return {"ok": all_ok, "checks": results}
+
+
+def _check_summary(report: dict) -> dict:
+    """Compact a check-all report, retaining details only for failures."""
+    summary = {"ok": report.get("ok", False),
+               "checks": {name: result.get("ok", False)
+                          for name, result in report.get("checks", {}).items()}}
+    failed = {name: result for name, result in report.get("checks", {}).items()
+              if not result.get("ok", False)}
+    if failed:
+        summary["failures"] = failed
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -2325,6 +2475,7 @@ def cmd_check_grid(args) -> int:
 # ---------------------------------------------------------------------------
 
 def _rewrite(tree, path: str):
+    ET.indent(tree, space="  ")
     tree.write(path, encoding="UTF-8", xml_declaration=True)
 
 
@@ -2938,42 +3089,128 @@ def _detect_buses(celem) -> list[tuple[str, int, list[str]]]:
     return buses
 
 
-def cmd_busify(args) -> int:
-    tree, root = _load(args.circ)
+def _busify_tree(root, circuit_names: set[str] | None = None,
+                 min_width: int = 2, explicit: bool = False) -> dict:
+    """Replace numbered scalar boundary pins with real bus pins + splitters.
+
+    Reusable subcircuits are deliberately left scalar: changing their pin
+    count would move every port on every existing instance.  A public wrapper
+    can be busified safely while instancing the scalar implementation.
+    """
+    names = _circ_names(root)
+    referenced = {
+        comp.get("name")
+        for celem in root.findall("circuit")
+        for comp in celem.findall("comp")
+        if comp.get("lib") is None and comp.get("name") in names
+    }
     targets = [c for c in root.findall("circuit")
-               if not args.circuit or c.get("name") == args.circuit]
-    report = {"converted": []}
+               if circuit_names is None or c.get("name") in circuit_names]
+    missing = sorted((circuit_names or set()) - {c.get("name") for c in targets})
+    report = {"converted": [], "skipped": [], "errors": []}
+    if missing:
+        report["errors"].append(f"circuit(s) not found: {', '.join(missing)}")
     for celem in targets:
         cname = celem.get("name")
         buses = _detect_buses(celem)
+        if buses and cname in referenced:
+            item = {
+                "circuit": cname,
+                "reason": "referenced subcircuit interfaces must stay scalar; busify a wrapper instead",
+            }
+            (report["errors"] if explicit else report["skipped"]).append(item)
+            continue
         for prefix, _, labels in buses:
-            if len(labels) < args.min_width:
+            if len(labels) < min_width:
                 continue
             n = len(labels)
-            for comp in celem.findall("comp"):
-                if comp.get("name") == "Pin" and _comp_attrs(comp).get("label") == labels[0]:
-                    _set_comp_attr(comp, "width", str(n))
-                    break
-            for label in labels[1:]:
-                for comp in list(celem.findall("comp")):
-                    if comp.get("name") == "Pin" and _comp_attrs(comp).get("label") == label:
-                        loc = _parse_loc(comp.get("loc"))
-                        celem.remove(comp)
-                        for wire in list(celem.findall("wire")):
-                            a, b = _parse_loc(wire.get("from")), _parse_loc(wire.get("to"))
-                            if a == loc or b == loc:
-                                celem.remove(wire)
-                        break
-            report["converted"].append({
-                "circuit": cname, "pin": labels[0], "width": n,
-                "removed": labels[1:],
-                "hint": f"Place a Splitter in Logisim on pin {labels[0]} "
-                        f"to fan out to {n} individual bit wires.",
+            pins = []
+            for label in labels:
+                pin = next((comp for comp in celem.findall("comp")
+                            if comp.get("name") == "Pin"
+                            and _comp_attrs(comp).get("label") == label), None)
+                if pin is not None:
+                    pins.append(pin)
+            attrs = [_comp_attrs(pin) for pin in pins]
+            locs = [_parse_loc(pin.get("loc")) for pin in pins]
+            is_outputs = [a.get("type") == "output" or a.get("output") == "true"
+                          for a in attrs]
+            widths = [int(a.get("width", "1")) for a in attrs]
+            dys = [locs[i + 1][1] - locs[i][1] for i in range(len(locs) - 1)]
+            incident = [[wire for wire in celem.findall("wire")
+                         if _parse_loc(wire.get("from")) == loc
+                         or _parse_loc(wire.get("to")) == loc]
+                        for loc in locs]
+            if (len(pins) != n or len(set(x for x, _ in locs)) != 1
+                    or len(set(is_outputs)) != 1 or any(w != 1 for w in widths)
+                    or not dys or len(set(dys)) != 1 or dys[0] <= 0
+                    or dys[0] % GRID or not 1 <= dys[0] // GRID <= 9
+                    or any(not wires for wires in incident)):
+                report["errors"].append({
+                    "circuit": cname, "bus": prefix,
+                    "reason": "pins must be wired scalar ports with one direction, vertical alignment, and even spacing",
+                })
+                continue
+
+            pin = pins[0]
+            old_x = locs[0][0]
+            spacing = dys[0] // GRID
+            origin_y = locs[-1][1] + GRID
+            is_output = is_outputs[0]
+            split_x = old_x - 4 * GRID if is_output else old_x + 4 * GRID
+            facing = "west" if is_output else "east"
+            appear = "right" if is_output else "left"
+
+            # Move and widen the retained boundary pin.  Each original scalar
+            # wire endpoint is retargeted to the corresponding splitter end.
+            pin.set("loc", f"({old_x},{origin_y})")
+            _set_comp_attr(pin, "label", prefix)
+            _set_comp_attr(pin, "width", str(n))
+            for old in pins[1:]:
+                celem.remove(old)
+
+            splitter = ET.SubElement(celem, "comp", {
+                "lib": "0", "loc": f"({split_x},{origin_y})", "name": "Splitter",
             })
-    _rewrite(tree, args.circ)
-    report["ok"] = True
+            for key, value in (("facing", facing), ("fanout", str(n)),
+                               ("incoming", str(n)), ("appear", appear),
+                               ("spacing", str(spacing))):
+                ET.SubElement(splitter, "a", {"name": key, "val": value})
+
+            ET.SubElement(celem, "wire", {
+                "from": f"({old_x},{origin_y})",
+                "to": f"({split_x},{origin_y})",
+            })
+            branch_x = split_x - 2 * GRID if is_output else split_x + 2 * GRID
+            for old_loc, wires in zip(locs, incident):
+                branch = f"({branch_x},{old_loc[1]})"
+                for wire in wires:
+                    if _parse_loc(wire.get("from")) == old_loc:
+                        wire.set("from", branch)
+                    if _parse_loc(wire.get("to")) == old_loc:
+                        wire.set("to", branch)
+            report["converted"].append({
+                "circuit": cname, "pin": prefix, "width": n,
+                "direction": "output" if is_output else "input",
+                "splitter": [split_x, origin_y],
+                "removed": labels[1:],
+            })
+    report["ok"] = not report["errors"]
+    return report
+
+
+def cmd_busify(args) -> int:
+    tree, root = _load(args.circ)
+    selected = {args.circuit} if args.circuit else None
+    report = _busify_tree(root, selected, args.min_width,
+                          explicit=args.circuit is not None)
+    if report["ok"]:
+        _rewrite(tree, args.circ)
+        post = check_all(args.circ)
+        report["checks"] = _check_summary(post)
+        report["ok"] = post["ok"]
     print(json.dumps(report, indent=2))
-    return 0
+    return 0 if report["ok"] else 1
 
 
 def cmd_build(args) -> int:
@@ -2995,6 +3232,16 @@ def cmd_build(args) -> int:
         _merge_into(out_path, nets)
     else:
         Path(out_path).write_text(emit_project(nets, seed))
+    if args.main:
+        tree, root = _load(out_path)
+        if _circ(root, args.main) is None:
+            raise ValueError(f"main circuit {args.main!r} not found in output")
+        main = root.find("main")
+        if main is None:
+            main = ET.Element("main")
+            root.insert(0, main)
+        main.set("name", args.main)
+        _rewrite(tree, out_path)
 
     report = {"circ": str(Path(out_path).resolve()), "circuits": {}}
     if merging:
@@ -3022,6 +3269,17 @@ def cmd_build(args) -> int:
             except ValueError as e:  # non-evaluable output without a spec
                 entry["behavioral"] = {"skipped": str(e)}
         report["circuits"][c.name] = entry
+    if args.busify and ok:
+        tree, root = _load(out_path)
+        selected = {c.name for c in circuits} if merging else None
+        bus_report = _busify_tree(root, selected, min_width=2, explicit=False)
+        if bus_report["ok"]:
+            _rewrite(tree, out_path)
+            post = check_all(out_path)
+            bus_report["checks"] = _check_summary(post)
+            bus_report["ok"] = post["ok"]
+        report["busify"] = bus_report
+        ok &= bus_report["ok"]
     if jar:
         l = load_check(jar, out_path)
         report["load"] = l
@@ -3057,7 +3315,9 @@ def cmd_verify(args) -> int:
 def cmd_check(args) -> int:
     d = describe(args.circ)
     errs = [e for c in d["circuits"] for e in c["structural_errors"]]
-    result = {"ok": not errs, "structural_errors": errs}
+    widths = check_widths(args.circ)
+    result = {"ok": not errs and widths["ok"],
+              "structural_errors": errs, "widths": widths}
     try:
         jar = find_jar(args.jar)
         l = load_check(jar, args.circ)
@@ -3081,9 +3341,12 @@ def main(argv=None) -> int:
     b = sub.add_parser("build", help="compile .logic -> verified .circ")
     b.add_argument("source")
     b.add_argument("-o", "--output")
+    b.add_argument("--main", help="circuit to open as the project's main circuit")
     b.add_argument("--jar", help="path to logisim-evolution jar")
     b.add_argument("--skip-sim", action="store_true",
                    help="structural check only (no java)")
+    b.add_argument("--busify", action="store_true",
+                   help="replace numbered pins on public circuits with buses + splitters")
     b.add_argument("--merge", action="store_true",
                    help="add/replace circuits inside an existing output file, "
                         "keeping its other circuits (enables `use` of them)")
@@ -3131,6 +3394,10 @@ def main(argv=None) -> int:
     cc = sub.add_parser("check-collision", help="wire T-junctions/crossings/shorts (#8)")
     cc.add_argument("circ")
     cc.set_defaults(fn=_checker(check_collision))
+
+    cw = sub.add_parser("check-widths", help="report connected ports with incompatible bit widths")
+    cw.add_argument("circ")
+    cw.set_defaults(fn=_checker(check_widths))
 
     cpin = sub.add_parser("check-pins",
                           help="hierarchy-aware pin contract + unconnected inputs (#5,#7)")
