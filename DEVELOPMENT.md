@@ -24,11 +24,43 @@ Architecture reference for contributors. For usage, see [README.md](README.md).
  ┌─ structural_check()   checks emitted geometry against intended netlist
  ├─ load_check()         headless load in Logisim Evolution
  └─ behavioral_check()   exhaustive simulation in Logisim Evolution
+     │
+     ▼ (--busify, after scalar behavioral verification)
+ _busify_tree()        ── public numbered pins → bus pins + Splitters
+     │
+     └─ check_all()       geometry + width + hierarchy re-check
+
+ schematic.py          ── reusable grid-safe emitter + physical XML evaluator
+      │
+      ├─ compact_arithmetic.py ── adder/addsub/array-multiplier templates
+      └─ datapath_templates.py ── JSON-registered comparator/minmax templates
+                                   │
+                                   └─ datapathc.py data-only CLI
 ```
 
 The `build` command chains all stages end-to-end. Every stage can also be
 called independently (e.g. `verify` skips compilation and only runs
 behavioral checks).
+
+### Compatibility boundary
+
+`circuitc.py` is still the generic scalar compiler. Its parser, AST, netlist,
+gate/switch layout engines, and existing CLI remain the default path. The
+structure-aware modules are companions rather than a replacement:
+
+- They consume generated scalar semantics instead of introducing native bus
+  expressions into `.logic`.
+- They replace presentation circuits by circuit name before `_rewrite()`;
+  they never patch an existing `.circ` by guessing coordinates.
+- They finish with `check_all()` plus a physical-net evaluator independent of
+  the scalar evaluator.
+- `datapathc.py` only accepts registered families and validated parameters; it
+  is not an unrestricted netlist-to-pretty-schematic claim.
+
+The core modifications are deliberately reusable prerequisites: stable CRC32
+layout jitter, splitter port geometry, width-constraining ports,
+hierarchy-safe `_busify_tree()`, and compact check summaries. Existing source
+programs do not need migration.
 
 ## Key data structures
 
@@ -198,6 +230,82 @@ missing components, etc.
 - Compares simulation output to expected values.
 - Reports mismatching rows with exact input assignments.
 
+### Public bus conversion (`_busify_tree`)
+
+The language and golden evaluator remain scalar. After those circuits pass
+their normal checks, `--busify` finds zero-based numbered boundary groups,
+moves one pin to a bus trunk, inserts an oriented Logisim Splitter, and retargets
+the former pin wires to its scalar ends. Splitter endpoint geometry is mirrored
+from Logisim Evolution's `SplitterParameters` in `_splitter_ports()`.
+
+Referenced circuit interfaces are never converted: reducing their pin count
+would move every port on every existing subcircuit instance. Use a public,
+unreferenced wrapper around a scalar reusable core instead. `check_widths()`
+constrains pin, gate, splitter, and subcircuit-port widths per physical net and
+catches the historical broken state where a wide pin drove a scalar wire with
+no splitter.
+
+### Compact arithmetic backend
+
+`compact_arithmetic.py` demonstrates the preferred architecture for large
+datapaths that would be unreadable after scalar lowering:
+
+- Wide subcircuit ports stay wide between arithmetic blocks.
+- Splitters are placed only at bit-level logic boundaries.
+- The ripple adder is a regular vertical bit slice with locally labelled carry
+  nets instead of global U-shaped wires.
+- The multiplier uses 16 partial-product AND gates followed by three staggered
+  rows containing four half adders and eight full adders.
+- `schematic.Schematic` rejects off-grid and diagonal geometry while emitting.
+- `schematic.evaluate_circuit()` independently simulates the emitted XML, including
+  wires, tunnels, splitters, gates, and hierarchy. This catches geometric
+  shorts that a source-level golden evaluator cannot see.
+
+The scalar `.logic` build still runs first and remains the behavioral oracle.
+Only after it passes is the compact structural version installed and checked.
+
+### Declarative datapath templates
+
+`datapath_templates.py` turns versioned JSON requests into scalar golden
+models plus structure-aware layouts. It is intentionally narrower than logic
+synthesis: a registered family owns its semantic expansion and visual grammar,
+while the request supplies only a name and width.
+
+Current families:
+
+| Template | Structure |
+|---|---|
+| `unsigned_comparator` | MSB-first bit-slice priority chain carrying LT/EQ/GT |
+| `unsigned_minmax` | generated comparator plus two generated bus mux banks |
+
+Generation is deterministic and stdlib-only. Widths 2–4 use exhaustive
+physical-vector verification; larger widths use boundary values, transitions
+around every power of two, equality rows, and a deterministic pseudorandom
+set. `check_all()` always runs regardless of width.
+
+To add another family:
+
+1. Add its name to `SUPPORTED_TEMPLATES` and validate its parameters.
+2. Emit a scalar `.logic` oracle before any parent that references it.
+3. Build its layout only with `schematic.Schematic` primitives.
+4. Add independent integer semantics to `verify()`.
+5. Add a JSON example and a deterministic build/physical-evaluation test.
+
+Do not add a coordinate patcher. Layout decisions belong to reusable rules
+such as bit-slice pitch, bus boundary placement, and channel allocation.
+
+File ownership is intentionally separated:
+
+| File | May know about circuit semantics? | May emit geometry? |
+|---|---:|---:|
+| `schematic.py` | No | Yes, only generic checked primitives |
+| `compact_arithmetic.py` | Arithmetic only | Yes, through `Schematic` |
+| `datapath_templates.py` | Registered template families | Yes, through `Schematic` |
+| `datapathc.py` | No | No; validates CLI I/O and reports JSON |
+
+Generated `.logic` and `.circ` examples are reproducibility fixtures. Their
+editable source is JSON or Python template code, never the emitted XML.
+
 ## Adding a new gate type
 
 1. Add an entry to `_CIRC_NAME` mapping your keyword to Logisim's component name.
@@ -240,7 +348,8 @@ evaluator. It recursively evaluates hierarchical circuits:
 | Evaluator | Gate-level, hierarchical, multi-output, specs, missing-defs error |
 | XML emission | Valid XML, structural check across 25+ circuit types, port map correctness |
 | CLI | `build` (single/multi/CMOS), `check`, `describe`, `merge` workflow |
-| Error detection | Sabotage caught, parse-time validation of invalid sources |
+| Error detection | Sabotage, width mismatch, and invalid-source rejection |
+| Bus conversion | Real splitters, endpoint wiring, hierarchy-safe wrappers |
 | Layout | Runaway-coordinate bounds |
 | Behavioral | Exhaustive Logisim sim (requires jar) |
 | Layout bounds | No runaway coordinates for representative circuits |
@@ -250,8 +359,8 @@ tests require a Logisim jar (`$LOGISIM_JAR` or `--jar`).
 
 ## Known limitations
 
-- **No buses / multi-bit signals.** Width syntax + splitters would need
-  vector generation changes and layout changes for wide pins.
+- **No native bus expressions.** `.logic` stays scalar, but numbered public
+  pins can be converted to bus pins and real splitters after verification.
 - **No sequential logic.** Flip-flops, registers, latches, cross-coupled
   gates need `--test-circuit` benches instead of truth table vectors.
 - **Instances inside switch-level circuits** are not supported. Keep `use`

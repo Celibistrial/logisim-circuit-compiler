@@ -18,8 +18,10 @@ let the tool compile and verify. If a `.circ` needs to change, change the
    python3 circuitc.py build design.logic -o design.circ
    ```
 3. Read the JSON on stdout.
-   - `"ok": true` → done. The `.circ` is proven correct by exhaustive
-     simulation in Logisim itself — do not second-guess it.
+   - `"ok": true` with `behavioral.ok` entries and `load.ok` → done. The
+     `.circ` passed exhaustive/random vectors in Logisim itself.
+   - `"ok": true` with a missing-jar warning or `--skip-sim` → structurally
+     verified only; report that simulation was skipped.
    - `"ok": false` → fix the `.logic` using the report (see below), rebuild.
 4. Deliver the `.circ` file.
 
@@ -28,34 +30,64 @@ parse tracebacks.
 
 ## Multi-bit pins with splitters
 
-The `.logic` format uses 1-bit signals only — a 64-bit adder compiles with
-individual `A0..A63` input pins. **Before delivering a `.circ`, convert
-groups of related pins into a single multi-bit pin + Splitter:**
+The `.logic` format stays 1-bit so exhaustive verification remains simple — a
+64-bit adder is written with `A0..A63`. **For delivered circuits, have the
+compiler replace public numbered pin groups with real multi-bit pins and
+Splitters:**
 
 ```bash
-# 1. Set one pin to the full bus width (others stay as-is)
-python3 circuitc.py set-property design.circ adder64 --label A0 --set width=64
-# 2. Remove the remaining individual pins
-for i in $(seq 1 63); do
-  python3 circuitc.py remove-pin design.circ adder64 A$i
-done
-# 3. Do the same for B inputs and S outputs (width=64, facing=west for outputs)
-python3 circuitc.py set-property design.circ adder64 --label B0 --set width=64
-python3 circuitc.py set-property design.circ adder64 --label S0 --set width=64
-# 4. In Logisim, place a Splitter on each wide pin to fan out/in the bit
-#    wires to internal subcircuit ports. The splitter maps bit lanes
-#    mechanically — use the "Fan Out" attribute to control direction.
+python3 circuitc.py build design.logic -o design.circ --busify
 
-# If re-running behavioral checks with a jar, rebuild the file first.
+# Or convert an already-built file (all safe public circuits, or one circuit):
+python3 circuitc.py busify design.circ
+python3 circuitc.py busify design.circ adder64
 ```
 
-- **Always prefer a single `width=N` pin over N individual 1-bit pins.**
-  The `.logic` requires individual pins at compile time, but the delivered
-  `.circ` should be cleaned up for clarity.
-- Use `python3 circuitc.py set-property` to change any pin's width, facing,
-  or label after building.
-- Pin widths don't affect structural checks — geometry stays valid.
-- Use `describe` to see all pin labels in a circuit before editing.
+- `busify` recognizes contiguous zero-based groups (`A0,A1,...`), emits one
+  pin labelled `A`, inserts and wires a correctly oriented Splitter, then runs
+  grid, proximity, collision, width, loop, and hierarchy checks.
+- Reusable subcircuit interfaces stay scalar because changing their pin count
+  would move ports on every existing instance. Create a public wrapper with
+  the same numbered scalar pins, instance the scalar core inside it, and let
+  `--busify` convert that unreferenced wrapper.
+- **Never widen a pin with `set-property` and delete the other pins.** That old
+  workflow disconnected the bit lanes. `check-widths` now detects the width
+  mismatch, but only `busify` performs the complete conversion.
+- Use `describe` to confirm that public interfaces are compact and contain
+  `Splitter` components before delivery.
+- For large arithmetic datapaths, boundary `busify` alone is not enough: the
+  scalar router will still create long global bit lanes. Use a structure-aware
+  backend built on `schematic.Schematic` so buses remain wide between
+  blocks and are split only beside bit-level logic.
+
+## Declarative datapath templates (no LLM at generation time)
+
+For supported regular datapaths, do not write topology or layout code. Write a
+JSON spec and invoke the template compiler:
+
+```bash
+python3 datapathc.py templates
+python3 datapathc.py build examples/compare_minmax.json \
+  -o examples/compare_minmax.circ
+```
+
+Version-1 requests have only `name`, `template`, and `width`. The current
+families are `unsigned_comparator` and `unsigned_minmax`, for widths 2–16.
+The compiler deterministically emits the scalar `.logic` oracle and structural
+`.circ`, runs grid/proximity/collision/width/loop/hierarchy checks, then tests
+the emitted physical nets. Never edit either generated file to improve its
+layout; change the JSON or shared template implementation and rebuild.
+
+This is the preferred workflow for repeated generation. A new circuit family
+requires one reviewed template implementation; subsequent widths, names, and
+projects are data-only and require no LLM call.
+
+This workflow is additive. Continue using `circuitc.py build` for arbitrary
+`.logic`, CMOS, and unsupported circuit families. Do not describe `datapathc`
+as general synthesis: it only accepts registered templates. `schematic.py`
+provides generic checked emission/evaluation primitives;
+`datapath_templates.py` owns family-specific semantics and layout;
+`datapathc.py` is only the JSON CLI.
 
 ## .logic format
 
@@ -153,7 +185,7 @@ python3 circuitc.py set-property file.circ circuit --label X --set width=64   # 
 ## Environment
 
 - Python ≥ 3.10, stdlib only.
-- Behavioral + load layers need `java` (≥16) and the Logisim Evolution jar:
+- Behavioral + load layers for Logisim Evolution 4.1 need Java ≥21 and the jar:
   auto-found in `/Applications/Logisim-evolution.app`, else set `$LOGISIM_JAR`
   or pass `--jar`. Without Java, `build --skip-sim` still gives structural
   verification — say so explicitly if you deliver an unsimulated circuit.
