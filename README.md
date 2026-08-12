@@ -40,6 +40,7 @@ needs only JSON data—no LLM, XML editing, or coordinate choices:
 python3 datapathc.py templates
 python3 datapathc.py build examples/compare_minmax.json \
   -o examples/compare_minmax.circ
+python3 datapathc.py build examples/mux8.json -o examples/mux8.circ
 ```
 
 ```json
@@ -53,7 +54,10 @@ python3 datapathc.py build examples/compare_minmax.json \
 }
 ```
 
-`datapathc` currently provides `unsigned_comparator` and `unsigned_minmax`.
+`datapathc` currently provides `mux2`, `unsigned_comparator`, and
+`unsigned_minmax`. `mux2` is a width-bit 2:1 mux: `D0` and `D1` are wide
+inputs, `S` is a one-bit selector, and `Y` equals `D0` when `S=0` or `D1`
+when `S=1`.
 It emits a scalar `.logic` golden model and a bus-aware `.circ`, runs all six
 physical checks, and evaluates the emitted wire geometry against integer
 semantics. Widths 2–16 are accepted; changing width or circuit name is a
@@ -88,11 +92,14 @@ regular datapaths may go through `datapathc.py`.
 | `circuitc.py` | Original scalar parser/compiler/router and verification CLI; now splitter- and width-aware |
 | `schematic.py` | Circuit-family-neutral, grid-checked XML emitter and physical wire/tunnel/splitter/hierarchy evaluator |
 | `compact_arithmetic.py` | Rule-based adder, add/subtract, and array-multiplier layouts used by the arithmetic example generator |
-| `datapath_templates.py` | Versioned JSON validation, scalar-oracle expansion, comparator/min/max layout rules, and integer verification |
+| `datapath_templates.py` | Versioned JSON validation, scalar-oracle expansion, mux/comparator/min/max layout rules, and integer verification |
 | `datapathc.py` | Small JSON command-line frontend; lists templates and builds verified artifacts |
 | `examples/compare_minmax.json` | Editable source of truth for the generated comparator/min/max example |
 | `examples/compare_minmax.logic` | Deterministically generated scalar golden model; do not hand-edit |
 | `examples/compare_minmax.circ` | Deterministically generated Logisim project; do not hand-edit |
+| `examples/mux8.json` | Editable source of truth for the generated 8-bit 2:1 mux example |
+| `examples/mux8.logic` | Deterministically generated scalar golden model; do not hand-edit |
+| `examples/mux8.circ` | Deterministically generated bus-aware mux project; do not hand-edit |
 
 The template layer is a registry, not general-purpose synthesis. A genuinely
 new visual family still needs one reviewed topology/layout implementation.

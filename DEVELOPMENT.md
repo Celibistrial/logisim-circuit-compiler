@@ -33,7 +33,7 @@ Architecture reference for contributors. For usage, see [README.md](README.md).
  schematic.py          ── reusable grid-safe emitter + physical XML evaluator
       │
       ├─ compact_arithmetic.py ── adder/addsub/array-multiplier templates
-      └─ datapath_templates.py ── JSON-registered comparator/minmax templates
+      └─ datapath_templates.py ── JSON-registered mux/comparator/minmax templates
                                    │
                                    └─ datapathc.py data-only CLI
 ```
@@ -275,6 +275,7 @@ Current families:
 
 | Template | Structure |
 |---|---|
+| `mux2` | width-bit 2:1 selector built from a vertical scalar mux-cell bank and three boundary splitters |
 | `unsigned_comparator` | MSB-first bit-slice priority chain carrying LT/EQ/GT |
 | `unsigned_minmax` | generated comparator plus two generated bus mux banks |
 

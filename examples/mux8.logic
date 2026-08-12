@@ -1,0 +1,19 @@
+circuit dp_mux2:
+  inputs D0, D1, S
+  outputs Y
+  not_s = ~S
+  choose_0 = D0 & not_s
+  choose_1 = D1 & S
+  Y = choose_0 | choose_1
+
+circuit mux8:
+  inputs D00, D01, D02, D03, D04, D05, D06, D07, D10, D11, D12, D13, D14, D15, D16, D17, S
+  outputs Y0, Y1, Y2, Y3, Y4, Y5, Y6, Y7
+  use dp_mux2 bit0(D0=D00, D1=D10, S=S) -> (Y=Y0)
+  use dp_mux2 bit1(D0=D01, D1=D11, S=S) -> (Y=Y1)
+  use dp_mux2 bit2(D0=D02, D1=D12, S=S) -> (Y=Y2)
+  use dp_mux2 bit3(D0=D03, D1=D13, S=S) -> (Y=Y3)
+  use dp_mux2 bit4(D0=D04, D1=D14, S=S) -> (Y=Y4)
+  use dp_mux2 bit5(D0=D05, D1=D15, S=S) -> (Y=Y5)
+  use dp_mux2 bit6(D0=D06, D1=D16, S=S) -> (Y=Y6)
+  use dp_mux2 bit7(D0=D07, D1=D17, S=S) -> (Y=Y7)

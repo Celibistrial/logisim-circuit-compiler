@@ -69,10 +69,13 @@ JSON spec and invoke the template compiler:
 python3 datapathc.py templates
 python3 datapathc.py build examples/compare_minmax.json \
   -o examples/compare_minmax.circ
+python3 datapathc.py build examples/mux8.json -o examples/mux8.circ
 ```
 
 Version-1 requests have only `name`, `template`, and `width`. The current
-families are `unsigned_comparator` and `unsigned_minmax`, for widths 2–16.
+families are `mux2`, `unsigned_comparator`, and `unsigned_minmax`, for widths
+2–16. `mux2` has wide `D0`/`D1` inputs, scalar selector `S`, and wide output
+`Y` (`S=0` selects `D0`; `S=1` selects `D1`).
 The compiler deterministically emits the scalar `.logic` oracle and structural
 `.circ`, runs grid/proximity/collision/width/loop/hierarchy checks, then tests
 the emitted physical nets. Never edit either generated file to improve its

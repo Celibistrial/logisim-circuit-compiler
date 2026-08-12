@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "main": "mux8",
+  "circuits": [
+    {"name": "mux8", "template": "mux2", "width": 8}
+  ]
+}
