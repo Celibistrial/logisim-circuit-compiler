@@ -13,6 +13,9 @@ import tempfile
 from pathlib import Path
 
 import circuitc
+import compact_arithmetic
+import datapath_templates
+import schematic
 
 
 # ── minimal test sources ────────────────────────────────────────────────────
@@ -64,6 +67,15 @@ circuit add1b:
   Cout = (A & B) | (Cin & t)
 """
 
+FULL_ADDER_NAMED = """
+circuit full_adder:
+  inputs A, B, Cin
+  outputs S, Cout
+  axb = A ^ B
+  S = axb ^ Cin
+  Cout = (A & B) | (Cin & axb)
+"""
+
 HIERARCHY = """
 circuit half_add:
   inputs A, B
@@ -77,6 +89,19 @@ circuit full_add:
   use half_add ha1(A=A, B=B) -> (S=s1, C=c1)
   use half_add ha2(A=s1, B=Cin) -> (S=S, C=c2)
   Cout = c1 | c2
+"""
+
+BUS_HIERARCHY = """
+circuit pair_core:
+  inputs A0, A1
+  outputs S0, S1
+  S0 = A0
+  S1 = A1
+
+circuit pair:
+  inputs A0, A1
+  outputs S0, S1
+  use pair_core core(A0=A0, A1=A1) -> (S0=S0, S1=S1)
 """
 
 CMOS = """
@@ -503,6 +528,17 @@ def test_build_multi_circuit():
         assert data["ok"]
         assert set(data["circuits"].keys()) >= {"inv", "nand2"}
 
+def test_build_is_reproducible_across_processes():
+    with tempfile.TemporaryDirectory() as td:
+        logic = Path(td) / "same.logic"
+        logic.write_text(HIERARCHY)
+        first = Path(td) / "first.circ"
+        second = Path(td) / "second.circ"
+        a = run_circuitc("build", str(logic), "-o", str(first), "--skip-sim")
+        b = run_circuitc("build", str(logic), "-o", str(second), "--skip-sim")
+        assert a.returncode == b.returncode == 0
+        assert first.read_bytes() == second.read_bytes()
+
 def test_build_cmos():
     with tempfile.TemporaryDirectory() as td:
         logic = Path(td) / "test.logic"
@@ -513,6 +549,144 @@ def test_build_cmos():
         data = json.loads(result.stdout)
         assert data["ok"]
         assert set(data["circuits"].keys()) >= {"cmos_inv", "cmos_nand", "cmos_nor"}
+
+def test_build_busify_real_splitters_and_safe_hierarchy():
+    with tempfile.TemporaryDirectory() as td:
+        logic = Path(td) / "bus.logic"
+        logic.write_text(BUS_HIERARCHY)
+        out = Path(td) / "bus.circ"
+        result = run_circuitc("build", str(logic), "-o", str(out),
+                              "--skip-sim", "--busify")
+        assert result.returncode == 0, result.stdout
+        data = json.loads(result.stdout)
+        assert data["ok"] and data["busify"]["checks"]["ok"]
+        assert {x["pin"] for x in data["busify"]["converted"]} == {"A", "S"}
+        assert any(x["circuit"] == "pair_core" for x in data["busify"]["skipped"])
+
+        root = circuitc.ET.parse(out).getroot()
+        core = circuitc._circ(root, "pair_core")
+        public = circuitc._circ(root, "pair")
+        assert circuitc._pin_orders(core) == (["A0", "A1"], ["S0", "S1"])
+        assert circuitc._pin_orders(public) == (["A"], ["S"])
+        splitters = [c for c in public.findall("comp") if c.get("name") == "Splitter"]
+        assert len(splitters) == 2
+        for splitter in splitters:
+            attrs = circuitc._comp_attrs(splitter)
+            assert attrs["incoming"] == attrs["fanout"] == "2"
+            assert attrs["spacing"] == "2"
+        assert circuitc.check_widths(str(out))["ok"]
+        assert not circuitc.analyze_circuit_xml(public)["floating"]
+
+def test_compact_arithmetic_layout_and_physical_evaluation():
+    with tempfile.TemporaryDirectory() as td:
+        defs = circuitc.parse_logic("""
+circuit half_adder:
+  inputs A, B
+  outputs S, C
+  S = A ^ B
+  C = A & B
+""" + FULL_ADDER_NAMED)
+        out = Path(td) / "compact.circ"
+        out.write_text(circuitc.emit_project(
+            [circuitc.compile_netlist(definition) for definition in defs]))
+        tree, root = circuitc._load(out)
+        root.extend([compact_arithmetic.build_adder8(),
+                     compact_arithmetic.build_addsub8(),
+                     compact_arithmetic.build_mult4()])
+        root.find("main").set("name", "adder8")
+        circuitc._rewrite(tree, out)
+
+        checks = circuitc.check_all(str(out))
+        assert checks["ok"], checks
+        # The old scalar multiplier had over 1,400 reported wire crossings.
+        assert len(checks["checks"]["collision"]["crossings"]) < 100
+        parsed = circuitc.ET.parse(out).getroot()
+        assert compact_arithmetic._evaluate_circuit(
+            parsed, "adder8", {"A": 255, "B": 1, "Cin": 0}) == {"S": 0, "Cout": 1}
+        assert compact_arithmetic._evaluate_circuit(
+            parsed, "addsub8", {"A": 128, "B": 1, "sub": 1}) == {
+                "S": 127, "zero": 0, "overflow": 1}
+        assert compact_arithmetic._evaluate_circuit(
+            parsed, "mult4", {"A": 15, "B": 15}) == {"P": 225}
+
+
+def test_datapath_templates_build_compare_and_minmax():
+    spec = {
+        "version": 1,
+        "main": "minmax4",
+        "circuits": [
+            {"name": "compare4", "template": "unsigned_comparator", "width": 4},
+            {"name": "minmax4", "template": "unsigned_minmax", "width": 4},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "datapath.circ"
+        report = datapath_templates.build(spec, out)
+        assert report["ok"] and report["physical_behavior"]["vectors"] == 512
+        root = circuitc.ET.parse(out).getroot()
+        assert root.find("main").get("name") == "minmax4"
+        compare = circuitc._circ(root, "compare4")
+        assert sum(comp.get("name") == "Splitter"
+                   for comp in compare.findall("comp")) == 2
+        assert schematic.evaluate_circuit(
+            root, "compare4", {"A": 3, "B": 12}) == {
+                "LT": 1, "EQ": 0, "GT": 0}
+        assert schematic.evaluate_circuit(
+            root, "minmax4", {"A": 3, "B": 12}) == {
+                "MIN": 3, "MAX": 12}
+
+
+def test_datapath_templates_are_deterministic():
+    spec = {"circuits": [
+        {"name": "compare4", "template": "unsigned_comparator", "width": 4},
+    ]}
+    with tempfile.TemporaryDirectory() as td:
+        first = Path(td) / "first.circ"
+        second = Path(td) / "second.circ"
+        datapath_templates.build(spec, first)
+        datapath_templates.build(spec, second)
+        assert first.read_bytes() == second.read_bytes()
+        assert first.with_suffix(".logic").read_bytes() == \
+            second.with_suffix(".logic").read_bytes()
+
+
+def test_datapath_template_spec_rejects_invalid_requests():
+    try:
+        datapath_templates.parse_spec({"circuits": [
+            {"name": "bad name", "template": "unsigned_comparator", "width": 8}
+        ]})
+    except ValueError as exc:
+        assert "invalid circuit name" in str(exc)
+    else:
+        raise AssertionError("invalid datapath request was accepted")
+
+def test_busify_rejects_referenced_interface():
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, BUS_HIERARCHY)
+        before = out.read_text()
+        result = run_circuitc("busify", str(out), "pair_core")
+        assert result.returncode == 1
+        data = json.loads(result.stdout)
+        assert not data["ok"] and data["errors"]
+        assert out.read_text() == before
+
+def test_check_widths_catches_wide_pin_on_scalar_net():
+    src = """
+circuit badbus:
+  inputs A0, A1
+  outputs Y
+  Y = A0 & A1
+"""
+    with tempfile.TemporaryDirectory() as td:
+        out = _build(td, src)
+        tree = circuitc.ET.parse(out)
+        celem = circuitc._circ(tree.getroot(), "badbus")
+        pin = next(c for c in celem.findall("comp")
+                   if c.get("name") == "Pin" and circuitc._comp_attrs(c).get("label") == "A0")
+        circuitc._set_comp_attr(pin, "width", "2")
+        tree.write(out, encoding="UTF-8", xml_declaration=True)
+        report = circuitc.check_widths(str(out))
+        assert not report["ok"] and report["mismatches"]
 
 def test_check_command():
     with tempfile.TemporaryDirectory() as td:
@@ -719,7 +893,7 @@ def test_check_all():
         out = _build(td, ONE_GATE)
         d = json.loads(run_circuitc("check-all", str(out)).stdout)
         assert d["ok"]
-        assert set(d["checks"]) == {"grid", "proximity", "collision", "loops", "pins"}
+        assert set(d["checks"]) == {"grid", "proximity", "collision", "widths", "loops", "pins"}
         assert all(v["ok"] for v in d["checks"].values())
         # --checks subset
         d2 = json.loads(run_circuitc("check-all", str(out),

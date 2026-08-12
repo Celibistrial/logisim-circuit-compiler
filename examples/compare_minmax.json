@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "main": "minmax8",
+  "circuits": [
+    {
+      "name": "compare8",
+      "template": "unsigned_comparator",
+      "width": 8
+    },
+    {
+      "name": "minmax8",
+      "template": "unsigned_minmax",
+      "width": 8
+    }
+  ]
+}
