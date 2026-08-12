@@ -636,6 +636,26 @@ def test_datapath_templates_build_compare_and_minmax():
                 "MIN": 3, "MAX": 12}
 
 
+def test_datapath_templates_build_mux_bank():
+    spec = {"circuits": [
+        {"name": "mux4", "template": "mux2", "width": 4},
+    ]}
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "mux.circ"
+        report = datapath_templates.build(spec, out)
+        assert report["ok"] and report["physical_behavior"]["vectors"] == 512
+        root = circuitc.ET.parse(out).getroot()
+        assert root.find("main").get("name") == "mux4"
+        assert circuitc._circ(root, "dp_compare_stage") is None
+        mux = circuitc._circ(root, "mux4")
+        assert sum(comp.get("name") == "Splitter"
+                   for comp in mux.findall("comp")) == 3
+        assert schematic.evaluate_circuit(
+            root, "mux4", {"D0": 3, "D1": 12, "S": 0}) == {"Y": 3}
+        assert schematic.evaluate_circuit(
+            root, "mux4", {"D0": 3, "D1": 12, "S": 1}) == {"Y": 12}
+
+
 def test_datapath_templates_are_deterministic():
     spec = {"circuits": [
         {"name": "compare4", "template": "unsigned_comparator", "width": 4},

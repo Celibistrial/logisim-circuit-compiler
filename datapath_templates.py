@@ -22,7 +22,7 @@ from schematic import Schematic, evaluate_circuit, reverse_bits, short_tunnel
 
 
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-SUPPORTED_TEMPLATES = ("unsigned_comparator", "unsigned_minmax")
+SUPPORTED_TEMPLATES = ("mux2", "unsigned_comparator", "unsigned_minmax")
 
 
 @dataclass(frozen=True)
@@ -295,8 +295,11 @@ def build_minmax(name: str, compare_name: str, mux_name: str,
 
 
 def expand(requests: list[Request], main: str) -> Expansion:
-    needs_compare = any(r.template in SUPPORTED_TEMPLATES for r in requests)
-    needs_mux = any(r.template == "unsigned_minmax" for r in requests)
+    needs_compare = any(
+        r.template in ("unsigned_comparator", "unsigned_minmax")
+        for r in requests)
+    needs_mux = any(
+        r.template in ("mux2", "unsigned_minmax") for r in requests)
     blocks = []
     if needs_compare:
         blocks.append(_compare_stage_source())
@@ -305,14 +308,20 @@ def expand(requests: list[Request], main: str) -> Expansion:
     layouts = {}
     internal_names = set()
     public_names = {request.name for request in requests}
-    reserved = {"dp_compare_stage"}
+    reserved = set()
+    if needs_compare:
+        reserved.add("dp_compare_stage")
     if needs_mux:
         reserved.add("dp_mux2")
     collision = sorted(public_names & reserved)
     if collision:
         raise ValueError(f"public names collide with template leaves: {collision}")
     for request in requests:
-        if request.template == "unsigned_comparator":
+        if request.template == "mux2":
+            blocks.append(_mux_bank_source(request.name, request.width))
+            layouts[request.name] = build_mux_bank(
+                request.name, request.width)
+        elif request.template == "unsigned_comparator":
             blocks.append(_comparator_source(request.name, request.width))
             layouts[request.name] = build_comparator(request.name, request.width)
         else:
@@ -353,6 +362,17 @@ def verify(root, expansion: Expansion) -> dict:
     for request in expansion.requests:
         count = 0
         for a, b in _verification_pairs(request.width):
+            if request.template == "mux2":
+                for select in (0, 1):
+                    out = evaluate_circuit(
+                        root, request.name, {"D0": a, "D1": b, "S": select})
+                    expected = {"Y": b if select else a}
+                    if out != expected:
+                        raise ValueError(
+                            f"{request.name} mismatch D0={a} D1={b} "
+                            f"S={select}: {out} != {expected}")
+                    count += 1
+                continue
             out = evaluate_circuit(root, request.name, {"A": a, "B": b})
             if request.template == "unsigned_comparator":
                 expected = {"LT": int(a < b), "EQ": int(a == b),
